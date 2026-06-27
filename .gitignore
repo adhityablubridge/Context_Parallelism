@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.o
+*_exec
+snippet_runner
+
+# Training data shards (too large for git; keep loader sources, not the data)
+Data_Loader/Data/
+Data_Loader/BluWERP_data/
+Data_Loader/Edufineweb_numpy/
+
+# Weight dumps / activation + gradient dumps
+*.bin
+*.npy
+
+# Editor / OS
+*.swp
+.DS_Store
