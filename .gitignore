@@ -16,3 +16,11 @@ Data_Loader/Edufineweb_numpy/
 # Editor / OS
 *.swp
 .DS_Store
+
+# Externally-maintained dependencies -- NOT part of the CP repo.
+# BluTrain bundles Tensor-Implementations (libtensor) + Profiler (libprofiler);
+# both are maintained separately and obtained/placed locally at ./BluTrain.
+BluTrain/
+
+# Legacy top-level submodule path (Tensor-Implementations now lives under BluTrain/)
+Tensor-Implementations/

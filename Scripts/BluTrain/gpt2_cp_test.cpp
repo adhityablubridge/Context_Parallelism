@@ -32,7 +32,7 @@ public:
 #include "nn/optimizer/Optim.h"
 #include "process_group/ProcessGroupNCCL.h"
 #include "process_group/device_mesh.h"
-#include "device/AllocationTracker.h"
+#include "profiler/AllocationTracker.h"
 // DataLoader (same path as gpt2_tp_test)
 #include "Data_Loader/dl_test.cpp"
 

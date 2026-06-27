@@ -7,6 +7,7 @@
 #include "ops/IndexingOps.h"
 #include "process_group/ProcessGroupNCCL.h"
 #include "process_group/device_mesh.h"
+#include "context_parallel/LoadBalancer.h"
 
 #include "context_parallel/ContextParallelBackward.h"
 #include "context_parallel/FusedSDPAOp.h"
@@ -27,7 +28,6 @@
 #include <nvtx3/nvToolsExt.h>
 
 using namespace OwnTensor;
-using namespace OwnTensor::dnn;
 
 // ---------------------------------------------------------------------------
 // RotatorType

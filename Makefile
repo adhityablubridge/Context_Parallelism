@@ -24,12 +24,22 @@ BINDIR := build
 MAIN_SRC := $(SCRIPTS_DIR)/gpt2_cp_test.cpp
 TARGET   := $(BINDIR)/gpt2_cp_test_exec
 
-# --- Tensor-Implementations submodule (provides libtensor) ---
-TENSOR_DIR    := Tensor-Implementations
+# --- Tensor-Implementations (provides libtensor) ---
+# Now nested under the BluTrain monorepo. libtensor itself links -lprofiler.
+TENSOR_DIR    := BluTrain/Tensor-Implementations
 TENSOR_INC    := $(TENSOR_DIR)/include
 TENSOR_LIBDIR := $(TENSOR_DIR)/lib
 TENSOR_LIB_A  := $(TENSOR_LIBDIR)/libtensor.a
 TENSOR_LIB_SO := $(TENSOR_LIBDIR)/libtensor.so
+
+# --- Profiler (provides libprofiler: AllocationTracker, Profiler, scopes) ---
+# Sibling of Tensor-Implementations under BluTrain/. Has no Makefile of its own,
+# so this Makefile builds libprofiler.so (pure host C++) from its sources.
+PROFILER_DIR    := BluTrain/Profiler
+PROFILER_INC    := $(PROFILER_DIR)/include
+PROFILER_LIBDIR := $(PROFILER_DIR)/lib
+PROFILER_LIB    := $(PROFILER_LIBDIR)/libprofiler.so
+PROFILER_SRCS   := $(shell find $(PROFILER_DIR)/src -name '*.cpp' 2>/dev/null)
 
 # =============================================================================
 # CUDA auto-detection
@@ -62,7 +72,7 @@ MPI_LIBDIR := $(shell $(CXX) --showme:libdirs 2>/dev/null | tr ' ' '\n' | head -
 # =============================================================================
 # Compiler / Linker Flags
 # =============================================================================
-INCLUDES := -I$(CP_ROOT) -I$(SCRIPTS_DIR) -I$(TENSOR_INC) -I$(CUDA_INC) -DWITH_CUDA
+INCLUDES := -I$(CP_ROOT) -I$(SCRIPTS_DIR) -I$(TENSOR_INC) -I$(PROFILER_INC) -I$(CUDA_INC) -DWITH_CUDA
 
 CXXFLAGS  := -std=c++17 -fPIC -O3 -g $(INCLUDES)
 NVCCFLAGS := -std=c++17 -Xcompiler="-fPIC" -arch=sm_$(SM_ARCH) -O3 -g \
@@ -70,23 +80,27 @@ NVCCFLAGS := -std=c++17 -Xcompiler="-fPIC" -arch=sm_$(SM_ARCH) -O3 -g \
 
 LINKFLAGS := -std=c++17 -Xcompiler="-fPIC" -arch=sm_$(SM_ARCH) -O3 -g -ccbin=$(CXX)
 
-LDFLAGS := -L$(CUDA_LIB) -L$(CUDA_TARGETS_LIB) -L$(TENSOR_LIBDIR)
+LDFLAGS := -L$(CUDA_LIB) -L$(CUDA_TARGETS_LIB) -L$(TENSOR_LIBDIR) -L$(PROFILER_LIBDIR)
 ifneq ($(MPI_LIBDIR),)
   LDFLAGS += -L$(MPI_LIBDIR) -Xlinker -rpath -Xlinker $(MPI_LIBDIR)
 endif
-LDFLAGS += -Xlinker -rpath -Xlinker '$$ORIGIN/$(TENSOR_LIBDIR)'
+LDFLAGS += -Xlinker -rpath -Xlinker '$$ORIGIN/$(TENSOR_LIBDIR)' \
+           -Xlinker -rpath -Xlinker '$$ORIGIN/$(PROFILER_LIBDIR)'
 
 # NVTX on CUDA 12+ is header-only -> no -lnvToolsExt.
+# -lprofiler provides OwnTensor::AllocationTracker / Profiler (from BluTrain/Profiler).
 LDLIBS := -lmpi -lnccl -lcudart -lcublas -lcublasLt -lcuda -lcurand \
-          -lgomp -lstdc++ -lnvidia-ml -lz -lpthread -ldl
+          -lgomp -lstdc++ -lnvidia-ml -lz -lpthread -ldl -lprofiler
 
 # Keep the link from being OOM-killed on the large -O3 training TU.
 LINK_MEMFLAGS := -Xlinker --no-keep-memory -Xlinker --reduce-memory-overheads
 
 # =============================================================================
 # Source / Object Discovery
-#   - All CP-owned .cu under context_parallel/ and process_group/.
-#   - All CP-owned .cpp under process_group/ (e.g. processGroupNCCL.cpp).
+#   - All CP-owned .cu  under context_parallel/ and process_group/.
+#   - All CP-owned .cpp under context_parallel/ and process_group/
+#     (e.g. context_parallel/ContextParallel.cpp, process_group/processGroupNCCL.cpp).
+#     Headers (LoadBalancer.h, *.h) need no rule -- they are found via -I. / -Iinclude.
 #   - Exclude alternates / standalone test files via CU_EXCLUDE / CPP_EXCLUDE.
 #   - Data_Loader/dl_test.cpp and the main TU are NOT discovered here
 #     (dl_test.cpp is #included directly by the main TU).
@@ -103,7 +117,7 @@ CPP_EXCLUDE := \
 CU_SOURCES := $(filter-out $(CU_EXCLUDE), \
                 $(shell find $(CP_DIR) $(PG_DIR) -name '*.cu' 2>/dev/null))
 CPP_SOURCES := $(filter-out $(CPP_EXCLUDE), \
-                $(shell find $(PG_DIR) -name '*.cpp' 2>/dev/null))
+                $(shell find $(CP_DIR) $(PG_DIR) -name '*.cpp' 2>/dev/null))
 
 OBJECTS_FROM_CU  := $(patsubst %.cu,$(OBJDIR)/%.o,$(CU_SOURCES))
 OBJECTS_FROM_CPP := $(patsubst %.cpp,$(OBJDIR)/%.o,$(CPP_SOURCES))
@@ -114,7 +128,7 @@ ALL_OBJECTS := $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) $(MAIN_OBJ)
 # =============================================================================
 # Top-level Targets
 # =============================================================================
-.PHONY: all libtensor run run-snippet run-folder \
+.PHONY: all libtensor profiler run run-snippet run-folder \
         clean rebuild print_sm help
 
 all: $(TARGET)
@@ -123,7 +137,7 @@ all: $(TARGET)
 # =============================================================================
 # Link the context-parallel training binary
 # =============================================================================
-$(TARGET): $(ALL_OBJECTS) | $(TENSOR_LIB_A)
+$(TARGET): $(ALL_OBJECTS) | $(TENSOR_LIB_A) $(PROFILER_LIB)
 	@echo -e "\n--- Linking executable (sm_$(SM_ARCH)): $@"
 	@mkdir -p $(BINDIR)
 	$(NVCC) $(LINKFLAGS) $(LDFLAGS) -o $@ $(ALL_OBJECTS) \
@@ -144,16 +158,28 @@ $(OBJDIR)/%.o: %.cu
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 # =============================================================================
-# libtensor -- delegate to the Tensor-Implementations submodule Makefile
+# libprofiler -- pure host-C++ shared lib (no Makefile in BluTrain/Profiler)
 # =============================================================================
-libtensor:
+profiler: $(PROFILER_LIB)
+	@echo "libprofiler is up-to-date: $(PROFILER_LIB)"
+
+$(PROFILER_LIB): $(PROFILER_SRCS)
+	@echo "--- Building libprofiler.so from $(PROFILER_DIR)/src ---"
+	@mkdir -p $(PROFILER_LIBDIR)
+	$(CXX) -std=c++17 -fPIC -O3 -shared -I$(PROFILER_INC) $(PROFILER_SRCS) -o $@
+
+# =============================================================================
+# libtensor -- delegate to the Tensor-Implementations Makefile.
+# libtensor links -lprofiler, so libprofiler must exist first.
+# =============================================================================
+libtensor: $(PROFILER_LIB)
 	@echo "--- Building libtensor in $(TENSOR_DIR) (SM_ARCH=$(SM_ARCH)) ---"
 	$(MAKE) -C $(TENSOR_DIR) tensor SM_ARCH=$(SM_ARCH)
 
 $(TENSOR_LIB_A):
 	@if [ ! -f $(TENSOR_LIB_A) ]; then \
 		echo -e "\n[ERROR] $(TENSOR_LIB_A) not found."; \
-		echo    "        Build the submodule first:  make libtensor"; \
+		echo    "        Build it first:  make libtensor   (builds libprofiler + libtensor)"; \
 		echo -e "        (or: make -C $(TENSOR_DIR) tensor)\n"; \
 		exit 1; \
 	fi
@@ -166,7 +192,7 @@ NP ?= 2
 
 run: $(TARGET)
 	@echo "--- Running $(TARGET) on $(NP) rank(s) ---"
-	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$$LD_LIBRARY_PATH \
+	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
 	    mpirun -np $(NP) ./$(TARGET) $(ARGS)
 
 # Compile + run a single standalone .cpp against libtensor, then keep the binary
@@ -182,7 +208,7 @@ run-snippet: | $(TENSOR_LIB_A)
 	        -Xlinker --start-group $(TENSOR_LIB_A) -Xlinker --end-group \
 	        $(LDLIBS) $(LINK_MEMFLAGS)
 	@echo -e "\n--- Running snippet_runner ---"
-	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$$LD_LIBRARY_PATH \
+	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
 	    mpirun -np $(NP) ./$(BINDIR)/snippet_runner $(ARGS)
 
 # Compile + run every .cpp in a folder. Usage: make run-folder FOLDER=dir [NP=2]
@@ -200,7 +226,7 @@ run-folder: | $(TENSOR_LIB_A)
 		$(NVCC) $(NVCCFLAGS) $(LDFLAGS) -o $(BINDIR)/snippet_runner "$$file" \
 		        -Xlinker --start-group $(TENSOR_LIB_A) -Xlinker --end-group \
 		        $(LDLIBS) $(LINK_MEMFLAGS) || exit 1; \
-		LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$$LD_LIBRARY_PATH \
+		LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
 		    mpirun -np $(NP) ./$(BINDIR)/snippet_runner $(ARGS) || exit 1; \
 	done
 	@rm -f $(BINDIR)/snippet_runner

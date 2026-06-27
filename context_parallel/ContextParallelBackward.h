@@ -6,6 +6,7 @@
 #include "core/Tensor.h"
 #include "process_group/ProcessGroupNCCL.h"
 #include "process_group/device_mesh.h"
+#include "context_parallel/LoadBalancer.h"
 
 #include "context_parallel/FusedSDPAOp.h"
 #include "context_parallel/RingRotator.h"
