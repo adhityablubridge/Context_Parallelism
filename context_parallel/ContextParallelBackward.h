@@ -5,13 +5,13 @@
 #include "autograd/ops_template.h"
 #include "core/Tensor.h"
 #include "process_group/ProcessGroupNCCL.h"
-#include "tensor/dtensor.h"
-#include "gpt2_cp_test/context_parallel/LoadBalancer.h"
+// #include "tensor/dtensor.h"
+#include "context_parallel/LoadBalancer.h"
 
-#include "gpt2_cp_test/context_parallel/FusedSDPAOp.h"
-#include "gpt2_cp_test/context_parallel/RingRotator.h"
-#include "gpt2_cp_test/context_parallel/SDPAMerger.h"
-#include "gpt2_cp_test/context_parallel/SDPAOp.h"
+#include "context_parallel/FusedSDPAOp.h"
+#include "context_parallel/RingRotator.h"
+#include "context_parallel/SDPAMerger.h"
+#include "context_parallel/SDPAOp.h"
 
 #include <atomic>
 #include <cmath>

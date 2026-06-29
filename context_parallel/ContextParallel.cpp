@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------------
 // Context-Parallel sequence sharding + HeadTail load-balancing implementations,
 // extracted from tensor/dtensor.cpp so all CP-specific code lives under
-// context_parallel/.
+// gpt2_cp_test/context_parallel/.
 //
 // Contains:
 //   - DTensor::context_parallel_shard / context_parallel_unshard
@@ -11,7 +11,7 @@
 //
 // Declarations: DTensor::context_parallel_* stay in tensor/dtensor.h (member
 // functions); LoadBalancer / HeadTail / SDPA_Merger are declared in
-// context_parallel/LoadBalancer.h.
+// gpt2_cp_test/context_parallel/LoadBalancer.h.
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
@@ -20,14 +20,19 @@
 #include <vector>
 
 #include "TensorLib.h"
-#include "process_group/device_mesh.h"
-#include "context_parallel/headtail_kernel.cuh"
+// #include "tensor/dtensor.h"
+#include "headtail_kernel.cuh"
 #include "context_parallel/LoadBalancer.h"
 
 using namespace OwnTensor;
 
 // ----- DTensor context-parallel sharding ----------------------------------
-
+// DEAD / LEGACY: DTensor::context_parallel_shard / unshard have ZERO call sites
+// (the live CP path shards via shard_sequence_pre_embed + HeadTail::loadbalance
+// + Tensor::make_shards_inplace_axis directly on raw Tensors, never through
+// DTensor). Kept commented for reference from the old DTensor-centric design.
+// Declarations in tensor/dtensor.h are commented out to match.
+/*
 void DTensor::context_parallel_shard(std::vector<Tensor> &chunks,
                                     LoadBalancer &load_balancer) {
      load_balancer.set_world_size(world_size_);
@@ -71,6 +76,7 @@ void DTensor::context_parallel_unshard(std::vector<Tensor> &chunks,
 
    load_balancer.unloadbalance(tensor_);
 }
+*/
 
 // ----- HeadTail load-balancing (chunk-level, PyTorch round-robin parity) ---
 

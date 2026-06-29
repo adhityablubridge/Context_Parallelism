@@ -4,18 +4,18 @@
 #include "autograd/operations/BinaryOps.h"
 #include "autograd/operations/ReshapeOps.h"
 #include "core/Tensor.h"
-#include "dnn/DistributedNN.h"
+// #include "dnn/DistributedNN.h"
 #include "ops/IndexingOps.h"
 #include "process_group/ProcessGroupNCCL.h"
-#include "tensor/dtensor.h"
-#include "gpt2_cp_test/context_parallel/LoadBalancer.h"
+#include "process_group/device_mesh.h"
+#include "context_parallel/LoadBalancer.h"
 
-#include "gpt2_cp_test/context_parallel/ContextParallelBackward.h"
-#include "gpt2_cp_test/context_parallel/FusedSDPAOp.h"
-#include "gpt2_cp_test/context_parallel/KVPackKernel.h"
-#include "gpt2_cp_test/context_parallel/RingRotator.h"
-#include "gpt2_cp_test/context_parallel/SDPAMerger.h"
-#include "gpt2_cp_test/context_parallel/SDPAOp.h"
+#include "context_parallel/ContextParallelBackward.h"
+#include "context_parallel/FusedSDPAOp.h"
+#include "context_parallel/KVPackKernel.h"
+#include "context_parallel/RingRotator.h"
+#include "context_parallel/SDPAMerger.h"
+#include "context_parallel/SDPAOp.h"
 
 #include <atomic>
 #include <cmath>
@@ -29,7 +29,6 @@
 #include <nvtx3/nvToolsExt.h>
 
 using namespace OwnTensor;
-using namespace OwnTensor::dnn;
 
 // ---------------------------------------------------------------------------
 // RotatorType
@@ -186,7 +185,7 @@ inline ShardedInputs shard_sequence_pre_embed(
 // The module does NOT own any parameters -- it wraps the attention
 // computation pattern for distributed execution.
 // ---------------------------------------------------------------------------
-class ContextParallel : public DModule {
+class ContextParallel {
 public:
   ContextParallel(const DeviceMesh &mesh, std::shared_ptr<ProcessGroupNCCL> pg,
                   float attn_scale, bool is_causal = true,

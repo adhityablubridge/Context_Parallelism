@@ -13,6 +13,12 @@ Data_Loader/Edufineweb_numpy/
 *.bin
 *.npy
 
+# Run outputs: AllocationTracker CSVs, training logs, per-rank debug dumps
+*.csv
+CP_Training_logs/
+1step*.csv
+debug_rank_*.md
+
 # Editor / OS
 *.swp
 .DS_Store

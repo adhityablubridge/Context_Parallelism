@@ -27,23 +27,22 @@ public:
 #include "autograd/operations/EmbeddingOps.h"
 #include "autograd/operations/LossOps.h"
 #include "checkpointing/GradMode.h"
-#include "dnn/DistributedNN.h"
+// #include "dnn/DistributedNN.h"
 #include "mlp/activation.h"
 #include "nn/NN.h"
 #include "nn/optimizer/Optim.h"
 #include "process_group/ProcessGroupNCCL.h"
-#include "tensor/dtensor.h"
-#include "device/AllocationTracker.h"
+#include "process_group/device_mesh.h"
+#include "profiler/AllocationTracker.h"
 // DataLoader (same path as gpt2_tp_test)
 #include "Data_Loader/dl_test.cpp"
 
 // Context Parallel
-#include "gpt2_cp_test/context_parallel/ContextParallel.h"
+#include "context_parallel/ContextParallel.h"
 
-#include "dnn/FusedLayerNormOp.h"
+// #include "dnn/FusedLayerNormOp.h"
 
 using namespace OwnTensor;
-using namespace OwnTensor::dnn;
 
 // =============================================================================
 // CudaTimer
@@ -263,7 +262,7 @@ public:
       T_out = unshard_ ? T * world_size_ : T;
     }
 
-    Tensor h = dnn::fused_layer_norm(x, ln.weight, ln.bias,
+    Tensor h = autograd::layer_norm(x, ln.weight, ln.bias,
                                      static_cast<int>(x.shape().dims[2]), ln.eps);
 
     Tensor qkv = c_attn.forward(h);
@@ -352,7 +351,7 @@ public:
 
   Tensor forward(const Tensor &x) override {
     emit_nvtx("MLP");
-    Tensor h = dnn::fused_layer_norm(x, ln.weight, ln.bias,
+    Tensor h = autograd::layer_norm(x, ln.weight, ln.bias,
                                      static_cast<int>(x.shape().dims.back()), ln.eps);
     h = fc_up.forward(h);
     h = autograd::gelu(h);
@@ -569,7 +568,7 @@ public:
 
     // Final LayerNorm
     timer_ln_f.start_timer();
-    x = dnn::fused_layer_norm(x, ln_f.weight, ln_f.bias, config.n_embd, ln_f.eps);
+    x = autograd::layer_norm(x, ln_f.weight, ln_f.bias, config.n_embd, ln_f.eps);
     if (dump_fwd) {
       dump_act("fwd_lnf_cpp.bin", x);
       fwd_dumped = true;
@@ -601,10 +600,10 @@ int main(int argc, char **argv) {
   // ISOLATION TEST (CP_ALLOC_LEGACY=1): reproduce the OLD tracker init — before
   // MPI_Init, shared "1step.csv" for all ranks. Used to test whether the
   // tracker relocation caused the peak-memory change.
-  const bool legacy_tracker = std::getenv("CP_ALLOC_LEGACY") != nullptr;
-  if (legacy_tracker) {
-    OwnTensor::AllocationTracker::instance().init("1step.csv");
-  }
+  // const bool legacy_tracker = std::getenv("CP_ALLOC_LEGACY") != nullptr;
+  // if (legacy_tracker) {
+  //   OwnTensor::AllocationTracker::instance().init("1step.csv");
+  // }
   MPI_Init(&argc, &argv);
 
   int rank, world_size;
@@ -614,12 +613,12 @@ int main(int argc, char **argv) {
   // Rank-aware allocation-trace filename so multiple ranks don't clobber one
   // shared file. Override base via CP_ALLOC_CSV (default "1step"); rank suffix
   // is always appended -> e.g. 1step_rank0.csv.
-  if (!legacy_tracker) {
-    const char *base = std::getenv("CP_ALLOC_CSV");
-    std::string csv = std::string(base ? base : "1step") + "_rank" +
-                      std::to_string(rank) + ".csv";
-    OwnTensor::AllocationTracker::instance().init(csv.c_str());
-  }
+  // if (!legacy_tracker) {
+  //   const char *base = std::getenv("CP_ALLOC_CSV");
+  //   std::string csv = std::string(base ? base : "1step") + "_rank" +
+  //                     std::to_string(rank) + ".csv";
+  //   OwnTensor::AllocationTracker::instance().init(csv.c_str());
+  // }
 
   if (rank == 0) {
     std::cout << "=== GPT-2 Context Parallel Training Script ===" << std::endl;
