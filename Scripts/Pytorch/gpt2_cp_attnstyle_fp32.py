@@ -115,11 +115,11 @@ cp_group      = torch.distributed.group.WORLD
 device         = torch.device("cuda", local_rank)
 master_process = (cp_rank == 0)
 
-# ── Optional: match C++ TF32 matmul precision (parity test only; env-gated) ──
-# Default PyTorch on Ampere uses fp32 matmul (allow_tf32=False). The C++ model
-# runs Linear GEMMs in TF32. Set PT_TF32=1 to make PT use TF32 too, isolating
-# whether the C++<->PT forward gap is just the TF32-vs-fp32 precision difference.
-if int(os.environ.get("PT_TF32", "0")) == 1:
+# ── Match C++ TF32 matmul precision (ON by default; env-gated) ──
+# The C++ model runs Linear GEMMs in TF32, so we default PT to TF32 too for
+# parity. Default PyTorch on Ampere would use fp32 matmul (allow_tf32=False).
+# Set PT_TF32=0 to force plain fp32 matmul (e.g. to isolate the TF32-vs-fp32 gap).
+if int(os.environ.get("PT_TF32", "1")) == 1:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     if master_process:

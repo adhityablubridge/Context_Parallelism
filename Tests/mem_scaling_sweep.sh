@@ -180,6 +180,7 @@ run_one() {  # impl rotator label e l h ty T
   echo "  -> [$impl] $label  rotator=$rot  T=$T  (tag=$tag)"
 
   if [[ "$impl" == "PT" ]]; then
+    PT_TF32="${PT_TF32:-1}" \
     MEM_PROBE=1 MEM_PROBE_STEPS=2 MODEL_LABEL="$label" ROTATE_METHOD="$rot" \
     N_EMBD="$e" N_LAYER="$l" N_HEAD="$h" WEIGHT_TYING="$ty" T="$T" \
     MEM_SNAPSHOT_DIR="$OUT_DIR" \
