@@ -976,21 +976,26 @@ int main(int argc, char **argv) {
 
     float val_loss_log = -1.0f;
 
-    // Auto-increment run index for the per-step debug dump file: scan existing
-    // debug_rank_lb{rank}_N.md files and pick the next free N. Each rank picks
-    // its own; aligns per-rank across reruns without overwriting.
+    // Per-step debug dump (block-0 c_attn/fc_up weight+grad to a rank-specific
+    // .md, for cross-impl diffing vs PyTorch). OFF by default; enable with
+    // CP_DEBUG_DUMP=1. When on, auto-increment the run index: scan existing
+    // debug_rank_lb{rank}_N.md and pick the next free N (per-rank, no overwrite).
+    bool debug_dump = (std::getenv("CP_DEBUG_DUMP") != nullptr);
     int debug_run_idx = 0;
-    while (true) {
-      std::string probe = "debug_rank_lb" + std::to_string(rank) + "_" +
-                          std::to_string(debug_run_idx) + ".md";
-      std::ifstream check(probe);
-      if (!check.good()) break;
-      ++debug_run_idx;
-    }
-    std::string debug_path = "debug_rank_lb" + std::to_string(rank) + "_" +
-                             std::to_string(debug_run_idx) + ".md";
-    if (rank == 0) {
-      std::cout << "Debug dump file: " << debug_path << "\n";
+    std::string debug_path;
+    if (debug_dump) {
+      while (true) {
+        std::string probe = "debug_rank_lb" + std::to_string(rank) + "_" +
+                            std::to_string(debug_run_idx) + ".md";
+        std::ifstream check(probe);
+        if (!check.good()) break;
+        ++debug_run_idx;
+      }
+      debug_path = "debug_rank_lb" + std::to_string(rank) + "_" +
+                   std::to_string(debug_run_idx) + ".md";
+      if (rank == 0) {
+        std::cout << "Debug dump file: " << debug_path << "\n";
+      }
     }
 
     for (int step = 0; step < max_steps; ++step) {
@@ -1405,7 +1410,8 @@ int main(int argc, char **argv) {
         // Mirrors PyTorch dump in Pytorch/gpt2_cp_headtail_fp32.py: writes the
         // first 4 elements of the [:2, :2] block of block-0 c_attn.weight,
         // c_attn.grad, fc_up.weight, fc_up.grad each step for cross-impl diff.
-        {
+        // Gated by CP_DEBUG_DUMP (off by default).
+        if (debug_dump) {
           auto dump4 = [&](std::ofstream &f, const char *label, const Tensor &t) {
             // C++ stores Linear weight as [in, out] (transpose of PT's [out, in]).
             // To make this dump diffable line-by-line against PyTorch's
