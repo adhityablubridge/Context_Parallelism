@@ -27,19 +27,23 @@ public:
 #include "autograd/operations/EmbeddingOps.h"
 #include "autograd/operations/LossOps.h"
 #include "checkpointing/GradMode.h"
+#include "dnn/DistributedNN.h"
 #include "mlp/activation.h"
 #include "nn/NN.h"
 #include "nn/optimizer/Optim.h"
 #include "process_group/ProcessGroupNCCL.h"
-#include "process_group/device_mesh.h"
-#include "profiler/AllocationTracker.h"
+#include "tensor/dtensor.h"
+#include "device/AllocationTracker.h"
 // DataLoader (same path as gpt2_tp_test)
 #include "Data_Loader/dl_test.cpp"
 
 // Context Parallel
-#include "context_parallel/ContextParallel.h"
+#include "gpt2_cp_test/context_parallel/ContextParallel.h"
+
+#include "dnn/FusedLayerNormOp.h"
 
 using namespace OwnTensor;
+using namespace OwnTensor::dnn;
 
 // =============================================================================
 // CudaTimer
@@ -259,7 +263,7 @@ public:
       T_out = unshard_ ? T * world_size_ : T;
     }
 
-    Tensor h = autograd::layer_norm(x, ln.weight, ln.bias,
+    Tensor h = dnn::fused_layer_norm(x, ln.weight, ln.bias,
                                      static_cast<int>(x.shape().dims[2]), ln.eps);
 
     Tensor qkv = c_attn.forward(h);
@@ -348,7 +352,7 @@ public:
 
   Tensor forward(const Tensor &x) override {
     emit_nvtx("MLP");
-    Tensor h = autograd::layer_norm(x, ln.weight, ln.bias,
+    Tensor h = dnn::fused_layer_norm(x, ln.weight, ln.bias,
                                      static_cast<int>(x.shape().dims.back()), ln.eps);
     h = fc_up.forward(h);
     h = autograd::gelu(h);
@@ -385,12 +389,19 @@ public:
         rank_(pg->get_rank()), world_size_(pg->get_worldsize()) {
     ln_f.to(device);
 
-    // CP_SHARE_FWD_ROTATOR=1: one forward ring rotator + staging shared by ALL
-    // layers (forward is sequential), instead of one persistent set per layer.
-    // Saves ~kv_numel*2 * n_layers resident at no throughput cost. Default off.
+    // One forward ring rotator + staging shared by ALL layers (forward is
+    // sequential), instead of one persistent set per layer. Saves
+    // ~kv_numel*2 * n_layers resident at no throughput cost, parity-exact.
+    // ON BY DEFAULT (verified: -1100MB @124M/T2048, throughput-neutral, 160-step
+    // grad-norm stable, all rotators). Set CP_SHARE_FWD_ROTATOR=0 to disable
+    // (per-layer rotators) for A/B.
     std::shared_ptr<ContextParallel::SharedFwdRing> shared_fwd_ring;
-    if (std::getenv("CP_SHARE_FWD_ROTATOR"))
-      shared_fwd_ring = std::make_shared<ContextParallel::SharedFwdRing>();
+    {
+      const char *e = std::getenv("CP_SHARE_FWD_ROTATOR");
+      const bool share = (e == nullptr) || !(e[0] == '0' && e[1] == '\0');
+      if (share)
+        shared_fwd_ring = std::make_shared<ContextParallel::SharedFwdRing>();
+    }
 
     for (int i = 0; i < cfg.n_layers; ++i) {
       auto a = std::make_shared<CPAttention>(
@@ -558,7 +569,7 @@ public:
 
     // Final LayerNorm
     timer_ln_f.start_timer();
-    x = autograd::layer_norm(x, ln_f.weight, ln_f.bias, config.n_embd, ln_f.eps);
+    x = dnn::fused_layer_norm(x, ln_f.weight, ln_f.bias, config.n_embd, ln_f.eps);
     if (dump_fwd) {
       dump_act("fwd_lnf_cpp.bin", x);
       fwd_dumped = true;
