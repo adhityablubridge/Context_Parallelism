@@ -234,6 +234,13 @@ public:
     // (CP_SHARE_FWD_ROTATOR). Backward rotators stay per-call/independent.
     if (shared_fwd_ring) cp_->set_shared_fwd_ring(shared_fwd_ring);
 
+    // CP_ATTN_MODE=ulysses: switch this layer to the DeepSpeed-style Ulysses
+    // all-to-all path (additive). Requires contiguous sharding -- main() forces
+    // load_balancing=false when this env is set. Default (unset) = ring path.
+    if (const char *m = std::getenv("CP_ATTN_MODE")) {
+      if (std::string(m) == "ulysses") cp_->enable_ulysses();
+    }
+
     ln.to(device);
     c_attn.to(device);
     c_proj.to(device);
@@ -685,6 +692,26 @@ int main(int argc, char **argv) {
       config.recompute_k = (e[0] == '1');
     }
 
+    // Attention mode: CP_ATTN_MODE=ulysses switches every CP layer to the
+    // DeepSpeed-style Ulysses all-to-all path (the layers read the same env in
+    // their ctor and call enable_ulysses()). Ulysses requires CONTIGUOUS
+    // sequence sharding, so force load_balancing=false here: this governs both
+    // the pre-embedding shard (shard_sequence_pre_embed) AND the CP layer, so
+    // the contiguous local shards line up with Ulysses' combine. (Default mode
+    // = ring, unchanged.)
+    const bool use_ulysses_mode =
+        std::getenv("CP_ATTN_MODE") != nullptr &&
+        std::string(std::getenv("CP_ATTN_MODE")) == "ulysses";
+    if (use_ulysses_mode) {
+      config.load_balancing = false;
+      // Label mem-probe snapshots (filename tag + header) as "ulysses" so the
+      // sweep table shows the attention mode rather than the unused ring rotator.
+      rotator_label = "ulysses";
+      if (rank == 0)
+        std::cout << "[CP attn mode] ULYSSES (all-to-all); load_balancing forced "
+                     "off (contiguous sharding)\n";
+    }
+
     const int B = static_cast<int>(config.batch_size);
     const int T = static_cast<int>(config.context_length);
     int global_batch = fourtyfour?65536:524288;
@@ -895,9 +922,16 @@ int main(int argc, char **argv) {
     // Optimizer
     nn::AdamW optimizer(params, max_lr, 0.9f, 0.95f, 1e-8f, 0.1f);
 
-    // Data loaders (same path as gpt2_tp_test)
-    std::string data_root =
-        "/home/blu-bridge25/TP/TensorParallelismBeta/DTensor/Data_Loader/Data/";
+    // Data loaders. Override with CP_DATA_ROOT; default is the repo's
+    // Data_Loader/Data (relative to the working dir the binary is run from --
+    // the repo root, e.g. via `make run`). Data shards are gitignored, so
+    // place them there or point CP_DATA_ROOT at wherever they live on this box.
+    std::string data_root;
+    if (const char *dr = std::getenv("CP_DATA_ROOT")) {
+      data_root = dr;
+    } else {
+      data_root = "Data_Loader/Data/";
+    }
     DataLoaderLite train_loader(B, T, 0, 1, "train", data_root, true, 100000000,
                                 rank);
     DataLoaderLite val_loader(B, T, 0, 1, "val", data_root, true, 100000000,

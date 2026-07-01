@@ -1,0 +1,51 @@
+=== GPT-2 Context Parallel Training Script ===
+[CP attn mode] ULYSSES (all-to-all); load_balancing forced off (contiguous sharding)
+Configuration:
+  vocab_size: 50304
+  context_length: 7168
+  n_embd: 384
+  n_layers: 3
+  n_heads: 6
+  B=4, T=7168
+  world_size: 2
+
+Initializing model on CUDA device 0...
+Parameters: 46710144
+Parameters per GPU: 46710144
+max_steps: 2
+warmup_steps: 1
+found 5 shards for split train
+found 1 shards for split val
+
+Starting training...
+Saving logs to: CP_Training_logs/CP_Training_log22.csv
+found 5 shards for split train
+found 1 shards for split val
+=== STEP 0 PARAM AUDIT ===
+params.size() = 41
+  param[0]: numel=384 grad.dtype=10 grad.contig=1 grad.ptr=0xfc0efdc00
+  param[1]: numel=384 grad.dtype=10 grad.contig=1 grad.ptr=0xfc0efe200
+  param[2]: numel=442368 grad.dtype=10 grad.contig=1 grad.ptr=0xfba7bba00
+  param[3]: numel=1152 grad.dtype=10 grad.contig=1 grad.ptr=0xfc0efca00
+  param[4]: numel=147456 grad.dtype=10 grad.contig=1 grad.ptr=0xfc0e6ca00
+  total_grad_numel=46710144 n_fp32=41 n_other=0 n_contig=41 n_noncontig=0
+step     0 | loss: 10.901487 | lr 6.0000e-04 | norm: 3.6758 | dt: 792.48ms | tok/sec: 36180.1 | mem: 9956MB | Time Left: 00 hrs : 00 mins
+  [TIMING] data: 0.7ms | fwd: 294.0ms | loss: 29.5ms | bwd: 412.1ms | clip: 2.5ms | optim: 5.2ms
+  [LAYER] tok_emb: 0.2ms | pos_emb: 0.0ms | attn_cp: 128.7ms | mlp: 14.7ms | ln_f: 0.2ms | lm_head: 46.9ms
+[ALLOCATOR] cudaMallocAsync(size=2884632576) failed: out of memory
+[ALLOCATOR] Hard OOM. Trimming cache...
+[ALLOCATOR] cudaMallocAsync(size=2884632576) failed: out of memory
+[ALLOCATOR] Hard OOM. Trimming cache...
+[ALLOCATOR] cudaMallocAsync(size=2884632576) failed: out of memory
+[ALLOCATOR] FATAL: Still OOM after trim.
+EXCEPTION RANK 0 STEP 1: CUDA OOM
+[ALLOCATOR] cudaMallocAsync(size=2884632576) failed: out of memory
+[ALLOCATOR] FATAL: Still OOM after trim.
+EXCEPTION RANK 1 STEP 1: CUDA OOM
+--------------------------------------------------------------------------
+prterun detected that one or more processes exited with non-zero status,
+thus causing the job to be terminated. The first process to do so was:
+
+   Process name: [prterun-blubridge25-MS-7E06-1441015@1,0]
+   Exit code:    1
+--------------------------------------------------------------------------

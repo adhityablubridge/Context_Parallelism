@@ -21,7 +21,7 @@ set -u  # (no -e: we WANT to continue after an OOM run fails)
 # ============================ EDIT THIS BLOCK ================================
 
 # Which GPUs to use. world_size = number of devices listed here.
-export CUDA_VISIBLE_DEVICES="4,5"
+export CUDA_VISIBLE_DEVICES="0,1"
 
 # Implementations to run (1=yes, 0=no). They never run concurrently.
 RUN_PT=1
@@ -37,7 +37,7 @@ PT_SCRIPT="${REPO_ROOT}/Scripts/Pytorch/gpt2_cp_attnstyle_fp32.py"
 CPP_EXEC="${REPO_ROOT}/build/gpt2_cp_test_exec"
 
 # Output: per-run snapshots + the results CSV.
-OUT_DIR="${SCRIPT_DIR}/mem_scaling_runs_fine"
+OUT_DIR="${SCRIPT_DIR}/mem_scaling_runs_fine_ulysses"
 
 # T sweep: start, doubling, with a hard cap so it cannot loop forever.
 T_START=1024
@@ -91,6 +91,22 @@ CONFIGS=(
 #   C++ BluTrain supports 3: p2p, alltoall, allgather
 PT_ROTATORS=(alltoall allgather)
 CPP_ROTATORS=(p2p alltoall allgather)
+
+# Attention mode for the C++ (CPP) runs:
+#   ""         -> ring context-parallel (sweeps CPP_ROTATORS as before)
+#   "ulysses"  -> DeepSpeed-style Ulysses all-to-all attention (CP_ATTN_MODE=ulysses).
+# Under Ulysses the ring rotator is NOT used (it forces load_balancing=off and
+# does its own all-to-all), so we collapse CPP_ROTATORS to a single pass to avoid
+# running identical configs three times. Requires n_head % world_size == 0.
+CPP_ATTN_MODE="ulysses"
+if [[ "$CPP_ATTN_MODE" == "ulysses" ]]; then
+  # One pass; the token "ulysses" is used purely as the rotator LABEL in the
+  # snapshot tag / CSV / table. The C++ binary overrides rotator_label to
+  # "ulysses" under CP_ATTN_MODE=ulysses so the snapshot filename it writes
+  # (CPP_<label>_ulysses_T<T>_ws<ws>.txt) matches what this script expects, and
+  # CP_ROTATOR="ulysses" is parsed by the binary as the (unused) default rotator.
+  CPP_ROTATORS=(ulysses)
+fi
 
 # Launchers (override if your cluster needs different flags).
 TORCHRUN="torchrun --standalone --nnodes=1"
@@ -187,10 +203,15 @@ run_one() {  # impl rotator label e l h ty T
       > "$log" 2>&1
     rc=$?
   else
+    # libtensor/libprofiler are shared libs the binary needs at runtime; the
+    # baked-in rpath ($ORIGIN/BluTrain/...) doesn't resolve from build/, so set
+    # LD_LIBRARY_PATH explicitly (mirrors `make run`). -x forwards it to ranks.
     CP_MEM_PROBE=1 CP_MEM_PROBE_STEPS=2 CP_MODEL_LABEL="$label" CP_ROTATOR="$rot" \
+    CP_ATTN_MODE="$CPP_ATTN_MODE" \
     CP_N_EMBD="$e" CP_N_LAYER="$l" CP_N_HEAD="$h" CP_WEIGHT_TYING="$ty" CP_T="$T" \
     MEM_SNAPSHOT_DIR="$OUT_DIR" \
-    timeout "$RUN_TIMEOUT" $MPIRUN -np "$WORLD_SIZE" "$CPP_EXEC" \
+    LD_LIBRARY_PATH="${REPO_ROOT}/BluTrain/Tensor-Implementations/lib:${REPO_ROOT}/BluTrain/Profiler/lib:${LD_LIBRARY_PATH:-}" \
+    timeout "$RUN_TIMEOUT" $MPIRUN -x LD_LIBRARY_PATH -np "$WORLD_SIZE" "$CPP_EXEC" \
       > "$log" 2>&1
     rc=$?
   fi

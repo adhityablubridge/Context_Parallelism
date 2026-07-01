@@ -1,0 +1,33 @@
+# MEM PROBE SNAPSHOT  tag=PT_44M_alltoall_T5120_ws2
+# impl=PyTorch label=44M rotator=alltoall n_embd=384 n_layer=3 n_head=6 weight_tying=False
+# B=4 T=5120 cp_world_size=2 params=45923712
+# torch.peak_alloc_mb(rank0)=9213.0 torch.peak_reserved_mb(rank0)=10902.0
+# SMI_USED_MB_PER_GPU=0,11167;1,11153
+# ---- nvidia-smi ----
+Wed Jul  1 15:01:40 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3060        On  |   00000000:01:00.0 Off |                  N/A |
+|  0%   65C    P0            105W /  170W |   11167MiB /  12288MiB |     67%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3060        On  |   00000000:05:00.0 Off |                  N/A |
+|  0%   66C    P0            106W /  170W |   11153MiB /  12288MiB |     60%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            3763      G   /usr/lib/xorg/Xorg                        4MiB |
+|    0   N/A  N/A         1430017      C   /usr/bin/python3                      11144MiB |
+|    1   N/A  N/A            3763      G   /usr/lib/xorg/Xorg                        4MiB |
+|    1   N/A  N/A         1430018      C   /usr/bin/python3                      11130MiB |
++-----------------------------------------------------------------------------------------+

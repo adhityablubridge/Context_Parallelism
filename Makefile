@@ -195,6 +195,52 @@ run: $(TARGET)
 	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
 	    mpirun -np $(NP) ./$(TARGET) $(ARGS)
 
+# =============================================================================
+# Phase-2 de-fused RoPE CP stand-in parity test (additive; new target).
+# Links the SAME CP/PG objects as the main exec (minus the main TU) + libtensor.
+# Build: make cp-rope-standin    Run: make run-cp-rope-standin NP=2
+# =============================================================================
+STANDIN_SRC := Tests/cp_rope_standin_parity.cpp
+STANDIN_OBJ := $(OBJDIR)/Tests/cp_rope_standin_parity.o
+STANDIN_EXE := $(BINDIR)/cp_rope_standin_parity_exec
+.PHONY: cp-rope-standin run-cp-rope-standin
+cp-rope-standin: $(STANDIN_EXE)
+$(STANDIN_EXE): $(STANDIN_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) | $(TENSOR_LIB_A) $(PROFILER_LIB)
+	@mkdir -p $(BINDIR)
+	@echo -e "\n--- Linking stand-in parity test (sm_$(SM_ARCH)): $@"
+	$(NVCC) $(LINKFLAGS) $(LDFLAGS) -o $@ \
+	        $(STANDIN_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) \
+	        -Xlinker --start-group $(TENSOR_LIB_A) -Xlinker --end-group \
+	        $(LDLIBS) $(LINK_MEMFLAGS)
+
+run-cp-rope-standin: $(STANDIN_EXE)
+	@echo "--- Running stand-in parity on $(NP) rank(s) ---"
+	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
+	    mpirun -np $(NP) ./$(STANDIN_EXE) $(ARGS)
+
+# =============================================================================
+# Ulysses (DeepSpeed-style) CP attention parity test (additive; new target).
+# Links the SAME CP/PG objects as the main exec (minus the main TU) + libtensor.
+# Build: make cp-ulysses    Run: make run-cp-ulysses NP=2  (and NP=4)
+# =============================================================================
+ULYSSES_SRC := Tests/cp_ulysses_parity.cpp
+ULYSSES_OBJ := $(OBJDIR)/Tests/cp_ulysses_parity.o
+ULYSSES_EXE := $(BINDIR)/cp_ulysses_parity_exec
+.PHONY: cp-ulysses run-cp-ulysses
+cp-ulysses: $(ULYSSES_EXE)
+$(ULYSSES_EXE): $(ULYSSES_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) | $(TENSOR_LIB_A) $(PROFILER_LIB)
+	@mkdir -p $(BINDIR)
+	@echo -e "\n--- Linking Ulysses parity test (sm_$(SM_ARCH)): $@"
+	$(NVCC) $(LINKFLAGS) $(LDFLAGS) -o $@ \
+	        $(ULYSSES_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) \
+	        -Xlinker --start-group $(TENSOR_LIB_A) -Xlinker --end-group \
+	        $(LDLIBS) $(LINK_MEMFLAGS)
+
+run-cp-ulysses: $(ULYSSES_EXE)
+	@echo "--- Running Ulysses parity on $(NP) rank(s) ---"
+	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
+	    mpirun -np $(NP) ./$(ULYSSES_EXE) $(ARGS)
+
 # Compile + run a single standalone .cpp against libtensor, then keep the binary
 # in $(BINDIR). Usage: make run-snippet FILE=path/to/file.cpp [NP=2]
 run-snippet: | $(TENSOR_LIB_A)

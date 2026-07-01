@@ -540,7 +540,15 @@ class DataLoaderLite:
     def __init__(self, B, T, split):
         self.B = B
         self.T = T
-        data_root = "/home/blu-bridge25/TP/TensorParallelismBeta/DTensor/Data_Loader/Data"
+        # Token-shard dir. Override with CP_DATA_ROOT; default is the repo's
+        # Data_Loader/Data (this script lives in CP/Scripts/Pytorch/, so the
+        # repo root is two levels up). Data shards are gitignored, so place
+        # them there or point CP_DATA_ROOT at wherever they live on this box.
+        data_root = os.environ.get(
+            "CP_DATA_ROOT",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "..", "Data_Loader", "Data"),
+        )
         shards = sorted(
             os.path.join(data_root, s)
             for s in os.listdir(data_root)

@@ -1,0 +1,35 @@
+# MEM PROBE SNAPSHOT  tag=CPP_44M_ulysses_T2048_ws2
+# impl=Cpp label=44M rotator=ulysses recompute_k=0 n_embd=384 n_layer=3 n_head=6 weight_tying=0
+# B=4 T=2048 cp_world_size=2 params=44744064
+# cudaMemGetInfo used_mb(rank0)=3812.2
+# ALLOC reserved_mb=3482.5 active_mb=718.7 requested_mb=682.8 cached_free_mb=2763.8 internal_frag_pct=4.99
+# ALLOC_PEAK active_peak_mb=3424.4 reserved_peak_mb=3482.5
+# SMI_USED_MB_PER_GPU=0,3813;1,3813
+# ---- nvidia-smi ----
+Wed Jul  1 15:06:35 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3060        On  |   00000000:01:00.0 Off |                  N/A |
+| 42%   66C    P0             63W /  170W |    3813MiB /  12288MiB |      6%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3060        On  |   00000000:05:00.0 Off |                  N/A |
+| 34%   54C    P0             62W /  170W |    3813MiB /  12288MiB |     84%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            3763      G   /usr/lib/xorg/Xorg                        4MiB |
+|    0   N/A  N/A         1440573      C   ...25/CP/build/gpt2_cp_test_exec       3790MiB |
+|    1   N/A  N/A            3763      G   /usr/lib/xorg/Xorg                        4MiB |
+|    1   N/A  N/A         1440574      C   ...25/CP/build/gpt2_cp_test_exec       3790MiB |
++-----------------------------------------------------------------------------------------+

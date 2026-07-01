@@ -12,6 +12,8 @@
 #include "context_parallel/RingRotator.h"
 #include "context_parallel/SDPAMerger.h"
 #include "context_parallel/SDPAOp.h"
+#include "context_parallel/RopeDeltas.h"      // 4-delta RoPE positions (additive)
+#include "context_parallel/FusedRoPESDPA.h"   // sdpa_fused_backward_rope (gated by CP_FUSED_ROPE)
 
 #include <atomic>
 #include <cmath>
@@ -57,8 +59,16 @@ public:
       int rank, bool unshard = true,
       bool recompute_k = true,
       bool sub_chunk_active = false,
-      bool external_balanced = false)
-      : Node(3), // 3 outputs: grad for q, k, v
+      bool external_balanced = false,
+      // RoPE opt-in (additive). When use_rope is false (GPT-2/wpe), this node
+      // behaves byte-identically to before: Node(3), 3-grad apply(), gamma
+      // members unused. When true, Node(5) and apply() also returns
+      // {dq_gamma, dk_gamma} on edges 3,4 (wired in ContextParallel.h).
+      bool use_rope = false, Tensor q_gamma = Tensor(),
+      Tensor k_gamma = Tensor(), Tensor cos_sin_cache = Tensor(),
+      float rope_eps = 1e-6f)
+      // 3 outputs (q,k,v), or 5 (+q_gamma,k_gamma) when RoPE + valid gammas.
+      : Node((use_rope && q_gamma.is_valid() && k_gamma.is_valid()) ? 5 : 3),
         saved_q_(saved_q), saved_k_chunks_(saved_k_chunks),
         saved_v_chunks_(saved_v_chunks),
         saved_causal_flags_(saved_causal_flags),
@@ -70,7 +80,10 @@ public:
         load_balance_(load_balance), world_size_(world_size), rank_(rank),
         unshard_(unshard), recompute_k_(recompute_k),
         sub_chunk_active_(sub_chunk_active),
-        external_balanced_(external_balanced) {}
+        external_balanced_(external_balanced),
+        use_rope_(use_rope), q_gamma_(q_gamma), k_gamma_(k_gamma),
+        cos_sin_cache_(cos_sin_cache), rope_eps_(rope_eps),
+        has_gamma_(use_rope && q_gamma.is_valid() && k_gamma.is_valid()) {}
 
   const char *name() const override { return "ContextParallelBackward"; }
 
@@ -138,6 +151,19 @@ public:
         saved_k_chunks_[0].shape(), saved_k_chunks_[0].opts());
     Tensor grad_value = Tensor::zeros(
         saved_v_chunks_[0].shape(), saved_v_chunks_[0].opts());
+
+    // RoPE QK-norm gamma grad accumulators (additive; only used when use_rope_).
+    // Replicated-parameter grads: accumulated LOCALLY over ring steps (NO
+    // rotation — see RopeGammaAccum.h); the per-rank partial is reduced across
+    // CP ranks by the existing model.parameters() all-reduce, not here.
+    Tensor grad_q_gamma, grad_k_gamma;
+    if (use_rope_) {
+      const int64_t hd = saved_q_.shape().dims[3];
+      if (q_gamma_.is_valid())
+        grad_q_gamma = Tensor::zeros(Shape({{hd}}), saved_q_.opts());
+      if (k_gamma_.is_valid())
+        grad_k_gamma = Tensor::zeros(Shape({{hd}}), saved_q_.opts());
+    }
 
     // dkv_rotater: pipelined rotation of dK/dV (only for LB path)
     std::unique_ptr<RingRotatorBase> dkv_rotater;
@@ -352,13 +378,40 @@ public:
           q_off = rank_ * static_cast<int>(T_local_bwd);
           k_off = source_rank * static_cast<int>(T_local_bwd);
         }
-        std::vector<Tensor> step_grads = sdpa_fused_backward(
-            q_bwd, k_bwd, v_bwd, grad_out_bwd, out_bwd, lse_bwd,
-            use_causal, attn_scale_, q_off, k_off);
 
-        grad_q_step = step_grads[0];
-        grad_k_step = step_grads[1];
-        grad_v_step = step_grads[2];
+        if (use_rope_) {
+          // RoPE path (additive): same 4-delta derivation as the forward ring
+          // loop (must match per step). Returns dQ/dK/dV + per-call gamma
+          // partials, which accumulate LOCALLY (no rotation).
+          OwnTensor::cp::SubChunk sc =
+              (i == 0) ? OwnTensor::cp::SubChunk::Full
+                       : (lb_active_bwd
+                              ? (i <= rank_ ? OwnTensor::cp::SubChunk::KHeadHalf
+                                            : OwnTensor::cp::SubChunk::QTailHalf)
+                              : OwnTensor::cp::SubChunk::Full);
+          OwnTensor::cp::SdpaDeltas dl = OwnTensor::cp::compute_deltas(
+              rank_, i, world_size_, static_cast<int>(T_local_bwd),
+              /*lb=*/lb_active_bwd, sc);
+          SDPARoPEBackwardResult rg = sdpa_fused_backward_rope(
+              q_bwd, k_bwd, v_bwd, grad_out_bwd, out_bwd, lse_bwd,
+              use_causal, attn_scale_, dl.q.d0, dl.q.d1, dl.k.d0, dl.k.d1,
+              cos_sin_cache_, q_gamma_, k_gamma_, rope_eps_);
+          grad_q_step = rg.dQ;
+          grad_k_step = rg.dK;
+          grad_v_step = rg.dV;
+          if (grad_q_gamma.is_valid())
+            grad_q_gamma = grad_q_gamma + rg.dq_gamma;  // local sum, no rotation
+          if (grad_k_gamma.is_valid())
+            grad_k_gamma = grad_k_gamma + rg.dk_gamma;  // local sum, no rotation
+        } else {
+          std::vector<Tensor> step_grads = sdpa_fused_backward(
+              q_bwd, k_bwd, v_bwd, grad_out_bwd, out_bwd, lse_bwd,
+              use_causal, attn_scale_, q_off, k_off);
+
+          grad_q_step = step_grads[0];
+          grad_k_step = step_grads[1];
+          grad_v_step = step_grads[2];
+        }
 
         // --- Per-step parity probe (gated by DUMP_CP_STEPS=1) ---
         // Dumps grad_q_step/grad_k_step/grad_v_step for each ring step,
@@ -699,7 +752,12 @@ public:
     }
 
     // ----- Phase 4: Unshard gradients -----
+    // Gamma grads are [hd] replicated-param partials (NOT sequence-sharded), so
+    // they are returned as-is in both unshard modes; cross-rank reduction is the
+    // existing model.parameters() all-reduce, not the per-shard all-gather.
     if (!unshard_) {
+      if (has_gamma_)
+        return {grad_q, grad_key, grad_value, grad_q_gamma, grad_k_gamma};
       return {grad_q, grad_key, grad_value};
     }
 
@@ -727,6 +785,8 @@ public:
       lb.unloadbalance(full_grad_v);
     }
 
+    if (has_gamma_)
+      return {full_grad_q, full_grad_k, full_grad_v, grad_q_gamma, grad_k_gamma};
     return {full_grad_q, full_grad_k, full_grad_v};
   }
 
@@ -738,6 +798,9 @@ public:
     saved_out_per_step_.clear();
     merged_lse_ = Tensor();
     merged_out_ = Tensor();
+    q_gamma_ = Tensor();
+    k_gamma_ = Tensor();
+    cos_sin_cache_ = Tensor();
   }
 
 private:
@@ -762,6 +825,14 @@ private:
   bool recompute_k_;
   bool sub_chunk_active_;
   bool external_balanced_;
+
+  // RoPE opt-in (additive; default off => unused, node behaves as 3-output).
+  bool use_rope_ = false;
+  Tensor q_gamma_;        // [hd] QK-norm scale (or invalid => skip)
+  Tensor k_gamma_;        // [hd] QK-norm scale (or invalid => skip)
+  Tensor cos_sin_cache_;  // [cache_len, hd] cos/sin cache
+  float rope_eps_ = 1e-6f;
+  bool has_gamma_ = false;  // use_rope_ && both gammas valid => node has 5 outputs
 
   std::unique_ptr<RingRotatorBase> create_rotator() const {
     switch (rotator_type_) {

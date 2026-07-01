@@ -1,0 +1,93 @@
+W0701 15:03:40.495000 1434319 torch/distributed/run.py:803] 
+W0701 15:03:40.495000 1434319 torch/distributed/run.py:803] *****************************************
+W0701 15:03:40.495000 1434319 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0701 15:03:40.495000 1434319 torch/distributed/run.py:803] *****************************************
+/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/backends/__init__.py:46: UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
+  self.setter(val)
+[PT_TF32] allow_tf32=True (matching C++ TF32 matmul precision)
+/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/backends/__init__.py:46: UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
+  self.setter(val)
+=== GPT-2 CP via _AttentionContextParallel (FP32, HeadTail LB) ===
+  Applied _AttentionContextParallel to 3 blocks
+Configuration:
+  vocab_size:     50304
+  context_length: 6144
+  n_embd:         384
+  n_layers:       3
+  n_heads:        6
+  B=4, T=6144
+  cp_world_size:  2
+  global_batch:   24576
+  grad_accum_steps: 1
+  Parameters:          27000192
+  max_steps:      2
+  warmup_steps:   1
+  CP API:         _AttentionContextParallel (ParallelStyle)
+Saving logs to: Pytorch_CP_AttnStyle_FP32_Training_logs/Pytorch_CP_AttnStyle_FP32_Training_log49.csv
+
+Starting training...
+step     0 | loss: 10.894066 | lr 6.0000e-04 | norm: 3.9840 | dt: 810.71ms | tok/sec: 30314.3 | Time Left: 00 hrs : 00 mins
+  [TIMING] data: 0.4ms | fwd: 369.6ms | bwd: 389.8ms | clip: 27.2ms | optim: 23.1ms
+  [LAYER] tok_emb: 0.3ms | pos_emb: 0.2ms | attn_cp: 211.9ms | mlp: 269.6ms | ln_f: 0.1ms | lm_head: 39.1ms
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/blu-bridge25/CP/Scripts/Pytorch/gpt2_cp_attnstyle_fp32.py", line 931, in <module>
+[rank0]:     (loss / grad_accum_steps).backward()
+[rank0]:   File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/_tensor.py", line 625, in backward
+[rank0]:     torch.autograd.backward(
+[rank0]:   File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/autograd/__init__.py", line 354, in backward
+[rank0]:     _engine_run_backward(
+[rank0]:   File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/autograd/graph.py", line 841, in _engine_run_backward
+[rank0]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.30 GiB. GPU 0 has a total capacity of 11.63 GiB of which 1.04 GiB is free. Including non-PyTorch memory, this process has 10.57 GiB memory in use. Of the allocated memory 8.16 GiB is allocated by PyTorch, and 2.17 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+[INSTRUMENTATION rank=0] patched: {'bwd': True}
+[INSTRUMENTATION rank=0] CP backward called 3 times
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/home/blu-bridge25/CP/Scripts/Pytorch/gpt2_cp_attnstyle_fp32.py", line 931, in <module>
+[rank1]:     (loss / grad_accum_steps).backward()
+[rank1]:   File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/_tensor.py", line 625, in backward
+[rank1]:     torch.autograd.backward(
+[rank1]:   File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/autograd/__init__.py", line 354, in backward
+[rank1]:     _engine_run_backward(
+[rank1]:   File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/autograd/graph.py", line 841, in _engine_run_backward
+[rank1]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank1]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.30 GiB. GPU 1 has a total capacity of 11.63 GiB of which 1.13 GiB is free. Including non-PyTorch memory, this process has 10.48 GiB memory in use. Of the allocated memory 8.11 GiB is allocated by PyTorch, and 2.14 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+[INSTRUMENTATION rank=1] patched: {'bwd': True}
+[INSTRUMENTATION rank=1] CP backward called 3 times
+E0701 15:03:44.265000 1434319 torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: 1) local_rank: 0 (pid: 1434373) of binary: /usr/bin/python3
+Traceback (most recent call last):
+  File "/home/blu-bridge25/.local/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+  File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+  File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+/home/blu-bridge25/CP/Scripts/Pytorch/gpt2_cp_attnstyle_fp32.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-07-01_15:03:44
+  host      : blubridge25-MS-7E06
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 1434374)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-07-01_15:03:44
+  host      : blubridge25-MS-7E06
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 1434373)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

@@ -1,0 +1,13 @@
+Compiling [CXX  | cp]: Scripts/BluTrain/gpt2_cp_test.cpp
+/home/blu-bridge25/.local/bin/mpic++ -std=c++17 -fPIC -O3 -g -I. -IScripts/BluTrain -IBluTrain/Tensor-Implementations/include -IBluTrain/Profiler/include -I/usr/local/cuda-13/include -DWITH_CUDA -c Scripts/BluTrain/gpt2_cp_test.cpp -o build/objects/Scripts/BluTrain/gpt2_cp_test.o
+
+--- Linking executable (sm_86): build/gpt2_cp_test_exec
+/usr/local/cuda-13/bin/nvcc -std=c++17 -Xcompiler="-fPIC" -arch=sm_86 -O3 -g -ccbin=/home/blu-bridge25/.local/bin/mpic++ -L/usr/local/cuda-13/lib64 -L/usr/local/cuda-13/targets/x86_64-linux/lib -LBluTrain/Tensor-Implementations/lib -LBluTrain/Profiler/lib -L/home/blu-bridge25/.local/lib -Xlinker -rpath -Xlinker /home/blu-bridge25/.local/lib -Xlinker -rpath -Xlinker '$ORIGIN/BluTrain/Tensor-Implementations/lib' -Xlinker -rpath -Xlinker '$ORIGIN/BluTrain/Profiler/lib' -o build/gpt2_cp_test_exec build/objects/context_parallel/ContextParallel.o build/objects/process_group/processGroupNCCL.o build/objects/process_group/device_mesh.o build/objects/context_parallel/headtail_kernel.o build/objects/context_parallel/AttentionBackward.o build/objects/context_parallel/FusedSDPABackwardKernel.o build/objects/context_parallel/FusedSDPAKernel.o build/objects/context_parallel/AttentionForward.o build/objects/context_parallel/KVPackKernel.o build/objects/Scripts/BluTrain/gpt2_cp_test.o \
+        -Xlinker --start-group BluTrain/Tensor-Implementations/lib/libtensor.a -Xlinker --end-group \
+        -lmpi -lnccl -lcudart -lcublas -lcublasLt -lcuda -lcurand -lgomp -lstdc++ -lnvidia-ml -lz -lpthread -ldl -lprofiler -Xlinker --no-keep-memory -Xlinker --reduce-memory-overheads
+[SUCCESS] build/gpt2_cp_test_exec
+
+Run with: make run NP=2
+
+
+Build complete: build/gpt2_cp_test_exec

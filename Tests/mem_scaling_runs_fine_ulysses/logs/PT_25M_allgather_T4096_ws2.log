@@ -1,0 +1,49 @@
+W0701 15:03:31.967000 1433987 torch/distributed/run.py:803] 
+W0701 15:03:31.967000 1433987 torch/distributed/run.py:803] *****************************************
+W0701 15:03:31.967000 1433987 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0701 15:03:31.967000 1433987 torch/distributed/run.py:803] *****************************************
+/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/backends/__init__.py:46: UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
+  self.setter(val)
+/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/backends/__init__.py:46: UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
+  self.setter(val)
+[PT_TF32] allow_tf32=True (matching C++ TF32 matmul precision)
+=== GPT-2 CP via _AttentionContextParallel (FP32, HeadTail LB) ===
+  Applied _AttentionContextParallel to 3 blocks
+Configuration:
+  vocab_size:     50304
+  context_length: 4096
+  n_embd:         384
+  n_layers:       3
+  n_heads:        6
+  B=4, T=4096
+  cp_world_size:  2
+  global_batch:   16384
+  grad_accum_steps: 1
+  Parameters:          26213760
+  max_steps:      2
+  warmup_steps:   1
+  CP API:         _AttentionContextParallel (ParallelStyle)
+Saving logs to: Pytorch_CP_AttnStyle_FP32_Training_logs/Pytorch_CP_AttnStyle_FP32_Training_log47.csv
+
+Starting training...
+step     0 | loss: 10.905643 | lr 6.0000e-04 | norm: 4.1473 | dt: 609.17ms | tok/sec: 26895.6 | Time Left: 00 hrs : 00 mins
+  [TIMING] data: 0.2ms | fwd: 311.5ms | bwd: 248.7ms | clip: 26.1ms | optim: 22.1ms
+  [LAYER] tok_emb: 0.2ms | pos_emb: 0.2ms | attn_cp: 174.2ms | mlp: 231.1ms | ln_f: 0.1ms | lm_head: 27.6ms
+step     1 | loss: 10.415796 | lr 6.0000e-04 | norm: 2.9756 | dt: 318.75ms | tok/sec: 51401.1 | Time Left: 00 hrs : 00 mins
+  [TIMING] data: 0.1ms | fwd: 100.0ms | bwd: 210.5ms | clip: 1.2ms | optim: 6.5ms
+  [LAYER] tok_emb: 0.1ms | pos_emb: 0.1ms | attn_cp: 42.4ms | mlp: 53.6ms | ln_f: 0.1ms | lm_head: 25.9ms
+[MEM_PROBE rank=0] tag=PT_25M_allgather_T4096_ws2 peak_alloc_mb=7243.5 peak_reserved_mb=8714.0
+[MEM_PROBE rank=1] tag=PT_25M_allgather_T4096_ws2 peak_alloc_mb=7207.5 peak_reserved_mb=8644.0
+[MEM_PROBE] wrote snapshot /home/blu-bridge25/CP/Tests/mem_scaling_runs_fine_ulysses/PT_25M_allgather_T4096_ws2.txt
+/home/blu-bridge25/.local/lib/python3.10/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+
+Training log saved to: Pytorch_CP_AttnStyle_FP32_Training_logs/Pytorch_CP_AttnStyle_FP32_Training_log47.csv
+
+=== CP via _AttentionContextParallel — Training Complete ===
+
+[INSTRUMENTATION rank=0] patched: {'bwd': True}
+[INSTRUMENTATION rank=1] patched: {'bwd': True}
+
+[INSTRUMENTATION rank=0] CP backward called 6 times
+[INSTRUMENTATION rank=1] CP backward called 6 times

@@ -1,0 +1,33 @@
+# MEM PROBE SNAPSHOT  tag=PT_163M_allgather_T1024_ws2
+# impl=PyTorch label=163M rotator=allgather n_embd=768 n_layer=12 n_head=12 weight_tying=False
+# B=4 T=1024 cp_world_size=2 params=163109376
+# torch.peak_alloc_mb(rank0)=4706.8 torch.peak_reserved_mb(rank0)=5048.0
+# SMI_USED_MB_PER_GPU=0,5313;1,5247
+# ---- nvidia-smi ----
+Wed Jul  1 15:05:32 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3060        On  |   00000000:01:00.0 Off |                  N/A |
+| 40%   65C    P2             88W /  170W |    5313MiB /  12288MiB |     85%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3060        On  |   00000000:05:00.0 Off |                  N/A |
+| 34%   56C    P2             95W /  170W |    5247MiB /  12288MiB |     78%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            3763      G   /usr/lib/xorg/Xorg                        4MiB |
+|    0   N/A  N/A         1438262      C   /usr/bin/python3                       5290MiB |
+|    1   N/A  N/A            3763      G   /usr/lib/xorg/Xorg                        4MiB |
+|    1   N/A  N/A         1438263      C   /usr/bin/python3                       5224MiB |
++-----------------------------------------------------------------------------------------+

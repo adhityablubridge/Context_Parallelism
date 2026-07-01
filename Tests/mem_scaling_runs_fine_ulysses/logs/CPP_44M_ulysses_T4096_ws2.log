@@ -1,0 +1,90 @@
+=== GPT-2 Context Parallel Training Script ===
+[CP attn mode] ULYSSES (all-to-all); load_balancing forced off (contiguous sharding)
+Configuration:
+  vocab_size: 50304
+  context_length: 4096
+  n_embd: 384
+  n_layers: 3
+  n_heads: 6
+  B=4, T=4096
+  world_size: 2
+
+Initializing model on CUDA device 0...
+Parameters: 45530496
+Parameters per GPU: 45530496
+max_steps: 2
+warmup_steps: 1
+found 5 shards for split train
+found 1 shards for split val
+
+Starting training...
+Saving logs to: CP_Training_logs/CP_Training_log19.csv
+found 5 shards for split train
+found 1 shards for split val
+=== STEP 0 PARAM AUDIT ===
+params.size() = 41
+  param[0]: numel=384 grad.dtype=10 grad.contig=1 grad.ptr=0xfc1d50c00
+  param[1]: numel=384 grad.dtype=10 grad.contig=1 grad.ptr=0xfc1d51200
+  param[2]: numel=442368 grad.dtype=10 grad.contig=1 grad.ptr=0xfc1b50c00
+  param[3]: numel=1152 grad.dtype=10 grad.contig=1 grad.ptr=0xfc1b4fa00
+  param[4]: numel=147456 grad.dtype=10 grad.contig=1 grad.ptr=0xfbdac6c00
+  total_grad_numel=45530496 n_fp32=41 n_other=0 n_contig=41 n_noncontig=0
+step     0 | loss: 10.898359 | lr 6.0000e-04 | norm: 3.7198 | dt: 453.97ms | tok/sec: 36090.6 | mem: 6148MB | Time Left: 00 hrs : 00 mins
+  [TIMING] data: 0.6ms | fwd: 198.4ms | loss: 22.1ms | bwd: 177.2ms | clip: 2.4ms | optim: 5.0ms
+  [LAYER] tok_emb: 0.3ms | pos_emb: 0.0ms | attn_cp: 63.6ms | mlp: 8.6ms | ln_f: 0.1ms | lm_head: 26.9ms
+=== STEP 1 PARAM AUDIT ===
+params.size() = 41
+  param[0]: numel=384 grad.dtype=10 grad.contig=1 grad.ptr=0xfc1d50c00
+  param[1]: numel=384 grad.dtype=10 grad.contig=1 grad.ptr=0xfc1d51200
+  param[2]: numel=442368 grad.dtype=10 grad.contig=1 grad.ptr=0xfc1b50c00
+  param[3]: numel=1152 grad.dtype=10 grad.contig=1 grad.ptr=0xfc1b4fa00
+  param[4]: numel=147456 grad.dtype=10 grad.contig=1 grad.ptr=0xfbdac6c00
+  total_grad_numel=45530496 n_fp32=41 n_other=0 n_contig=41 n_noncontig=0
+step     1 | loss: 10.405602 | lr 6.0000e-04 | norm: 2.8511 | dt: 330.33ms | tok/sec: 49598.6 | mem: 6980MB | Time Left: 00 hrs : 00 mins
+  [TIMING] data: 0.0ms | fwd: 91.7ms | loss: 4.9ms | bwd: 178.3ms | clip: 2.3ms | optim: 3.9ms
+  [LAYER] tok_emb: 0.1ms | pos_emb: 0.0ms | attn_cp: 51.1ms | mlp: 8.6ms | ln_f: 0.1ms | lm_head: 27.0ms
+[MEM_PROBE rank=0] tag=CPP_44M_ulysses_T4096_ws2 used_mb=6980.2
+[MEM_PROBE rank=1] tag=CPP_44M_ulysses_T4096_ws2 used_mb=6980.2
+
+==================== OwnTensor - CUDA Caching Allocator Stats ====================
+
+--- Memory Usage ---
+  Active (in use):     728.331 MB (peak: 6313.78 MB)
+  Allocated (CUDA):    694.897 MB (peak: 6313.78 MB)
+  Reserved (cached):   6592.31 MB (peak: 6592.31 MB)
+
+--- Pool Breakdown ---
+  Small pool:          2.31055 MB allocated, 0.000488281 MB cached
+  Large pool:          6590 MB allocated, 5863.98 MB cached
+
+--- Allocation Stats ---
+  Total allocations:   675
+  Total frees:         504
+  Cache hits:          574 (85.037%)
+  Cache misses:        101
+
+--- CUDA Driver Calls ---
+  Malloc calls:        101
+  Free calls:          36
+
+--- Cross-Stream Usage ---
+  recordStream calls:  0
+  Deferred frees:      0
+
+--- Block Operations ---
+  Block splits:        281
+  Block merges:        168
+
+--- OOM Recovery ---
+  OOM events:          0
+  Successful retries:  0
+
+--- Derived Metrics ---
+  Fragmentation:       4.59044%
+=======================================================================
+
+[MEM_PROBE] wrote snapshot /home/blu-bridge25/CP/Tests/mem_scaling_runs_fine_ulysses/CPP_44M_ulysses_T4096_ws2.txt
+
+Training log saved to: CP_Training_logs/CP_Training_log19.csv
+
+=== Context Parallel Training Complete ===

@@ -16,6 +16,11 @@
 #include "context_parallel/RingRotator.h"
 #include "context_parallel/SDPAMerger.h"
 #include "context_parallel/SDPAOp.h"
+#include "context_parallel/RopeDeltas.h"      // 4-delta RoPE position helper (additive)
+#include "context_parallel/FusedRoPESDPA.h"   // sdpa_fused_forward_rope (gated by CP_FUSED_ROPE)
+#include "context_parallel/UlyssesAttention.h"        // Ulysses all-to-all layout transforms (additive)
+#include "context_parallel/UlyssesAttentionBackward.h" // Ulysses backward node (additive)
+#include "context_parallel/UlyssesGQAAttentionBackward.h" // Ulysses GQA backward node (additive)
 
 #include <atomic>
 #include <cmath>
@@ -213,6 +218,29 @@ public:
     shared_fwd_ring_ = std::move(r);
   }
 
+  // Opt this CP layer into the FUSED RoPE attention path (additive). When set,
+  // the forward ring loop derives 4 per-side position deltas and calls
+  // sdpa_fused_forward_rope(...) instead of the scalar-offset sdpa_fused_forward.
+  // Left unset (default), behavior is byte-identical to the GPT-2/wpe path.
+  // cache: [cache_len, hd] cos/sin; q_gamma/k_gamma: [hd] QK-norm scales
+  // (pass invalid Tensors to skip QK-norm).
+  void enable_rope(const Tensor &cos_sin_cache, const Tensor &q_gamma,
+                   const Tensor &k_gamma, float eps = 1e-6f) {
+    cos_sin_cache_ = cos_sin_cache;
+    q_gamma_ = q_gamma;
+    k_gamma_ = k_gamma;
+    rope_eps_ = eps;
+    use_rope_ = true;
+  }
+
+  // Opt this CP layer into the DeepSpeed-style ULYSSES attention path (additive).
+  // When set, forward_cp dispatches to forward_ulysses (a single all-to-all layout
+  // swap + one full-sequence causal SDPA + all-to-all back) instead of the ring.
+  // Left unset (default), behavior is byte-identical to the ring path.
+  // v1: MHA only (H % world_size == 0), contiguous sharding (no HeadTail),
+  // blocking all-to-all. pre_sharded inputs are rejected (see forward_ulysses).
+  void enable_ulysses() { use_ulysses_ = true; }
+
   // -----------------------------------------------------------------------
   // forward
   //
@@ -234,6 +262,12 @@ public:
                     bool unshard = true,
                     bool pre_sharded = false)
   {
+    // ----- Ulysses opt-in gate (additive) -----
+    // When enabled, take the all-to-all Ulysses path and bypass the ring
+    // entirely. The ring code below is left untouched for the default path.
+    if (use_ulysses_)
+      return forward_ulysses(q, k, v, unshard, pre_sharded);
+
     // ----- Phase 1: Context Parallel Shard -----
     // Shard Q along dim=2 (sequence dim in 4D [B, H, T, D])
     // K, V also sharded along dim=2
@@ -582,8 +616,28 @@ public:
                   << " causal=" << (use_causal ? 1 : 0)
                   << " partial=" << (use_partial ? 1 : 0) << "\n";
       }
-      SDPAResult result = sdpa_fused_forward(
-          q_use, k_use, v_use, use_causal, attn_scale_, q_off, k_off);
+      // RoPE path (additive, gated): when this CP layer wraps the fused
+      // RoPE kernel, derive the 4 per-side deltas and call the RoPE wrapper.
+      // Default (use_rope_==false, GPT-2/wpe) takes the EXACT existing call.
+      SDPAResult result;
+      if (use_rope_) {
+        OwnTensor::cp::SubChunk sc =
+            (i == 0) ? OwnTensor::cp::SubChunk::Full
+                     : (sub_chunk_active
+                            ? (i <= rank_ ? OwnTensor::cp::SubChunk::KHeadHalf
+                                          : OwnTensor::cp::SubChunk::QTailHalf)
+                            : OwnTensor::cp::SubChunk::Full);
+        OwnTensor::cp::SdpaDeltas dl = OwnTensor::cp::compute_deltas(
+            rank_, i, world_size_, static_cast<int>(T_local_fwd),
+            /*lb=*/sub_chunk_active, sc);
+        result = sdpa_fused_forward_rope(
+            q_use, k_use, v_use, use_causal, attn_scale_,
+            dl.q.d0, dl.q.d1, dl.k.d0, dl.k.d1,
+            cos_sin_cache_, q_gamma_, k_gamma_, rope_eps_);
+      } else {
+        result = sdpa_fused_forward(
+            q_use, k_use, v_use, use_causal, attn_scale_, q_off, k_off);
+      }
 
       // CP_DRAIN_AT=2: drain AFTER SDPA, before merger.step (see point 1 note).
       {
@@ -918,7 +972,11 @@ public:
           saved_partial_flags, saved_lse_per_step, saved_out_per_step,
           merged_lse, merged_out.detach(), pg_, attn_scale_, is_causal_,
           rot_type, load_balance_, world_size_, rank_, unshard, recompute_k_,
-          sub_chunk_active, external_balanced);
+          sub_chunk_active, external_balanced,
+          // RoPE opt-in (additive): forwards gammas/cache so the backward can
+          // recompute RoPE+QK-norm and emit per-call gamma grads. All default
+          // to invalid/false on the GPT-2/wpe path.
+          use_rope_, q_gamma_, k_gamma_, cos_sin_cache_, rope_eps_);
 
       if (q.requires_grad()) {
         Tensor &q_mut = const_cast<Tensor &>(q);
@@ -931,6 +989,16 @@ public:
       if (v.requires_grad()) {
         Tensor &v_mut = const_cast<Tensor &>(v);
         grad_fn->set_next_edge(2, autograd::get_grad_edge(v_mut));
+      }
+      // Gamma edges (3,4) only when RoPE is on AND the gammas are learnable.
+      // Routes the node's dq_gamma/dk_gamma (outputs 3,4) to the parameters'
+      // grad accumulation; from there the existing CP param all-reduce sums
+      // them across ranks. Off by default => GPT-2/wpe node stays 3-output.
+      if (use_rope_ && q_gamma_.is_valid() && k_gamma_.is_valid()) {
+        if (q_gamma_.requires_grad())
+          grad_fn->set_next_edge(3, autograd::get_grad_edge(q_gamma_));
+        if (k_gamma_.requires_grad())
+          grad_fn->set_next_edge(4, autograd::get_grad_edge(k_gamma_));
       }
 
       output_tensor.set_grad_fn(grad_fn);
@@ -957,6 +1025,210 @@ public:
   }
 
 private:
+  // -----------------------------------------------------------------------
+  // forward_ulysses (additive; reached only via the use_ulysses_ gate).
+  //
+  // DeepSpeed-style Ulysses sequence parallelism. Replaces the ring with a
+  // single all-to-all layout swap, one full-sequence causal SDPA over the
+  // local head group, and an all-to-all back. See UlyssesAttention.h.
+  // v1: MHA only, contiguous sharding (no HeadTail), blocking all-to-all.
+  // -----------------------------------------------------------------------
+  Tensor forward_ulysses(Tensor &q, Tensor &k, Tensor &v, bool unshard,
+                         bool pre_sharded) {
+    // GQA/MQA dispatch (additive gate): when KV has fewer heads than Q, take the
+    // separate GQA path. MHA (equal head counts) falls through to the unchanged
+    // body below.
+    if (k.shape().dims[1] != q.shape().dims[1])
+      return forward_ulysses_gqa(q, k, v, unshard, pre_sharded);
+
+    // pre_sharded inputs are accepted ONLY when this layer is NOT load-balanced.
+    // Ring callers that load-balance hand in HeadTail/zig-zag-sharded tensors,
+    // which would silently mis-order the gathered sequence. With load_balance_
+    // off, the caller's shard is contiguous (rank r -> seq block r), exactly the
+    // layout Ulysses needs. (Critique pt 1: this is a CHECKABLE guard, not a
+    // blanket ban, because the layer knows its own load_balance_ flag.)
+    if (pre_sharded && load_balance_)
+      throw std::runtime_error(
+          "Ulysses: pre_sharded inputs require load_balance=false (HeadTail/"
+          "zig-zag shards would mis-order the gathered sequence).");
+
+    const int P = world_size_;
+    const auto &qd = q.shape().dims;
+    const int64_t H = qd[1];
+    if (H % P != 0)
+      throw std::runtime_error("Ulysses: H must be divisible by world_size");
+    if (k.shape().dims[1] != H || v.shape().dims[1] != H)
+      throw std::runtime_error(
+          "Ulysses v1: MHA only (q/k/v head counts must match)");
+
+    // 1. Obtain this rank's contiguous local seq shard [B,H,Tl,D].
+    Tensor ql, kl, vl;
+    if (pre_sharded) {
+      // q/k/v are already the local contiguous shard (the caller seq-sharded
+      // contiguously). Use directly; do NOT re-shard.
+      ql = autograd::contiguous(q);
+      kl = autograd::contiguous(k);
+      vl = autograd::contiguous(v);
+    } else {
+      // Full [B,H,T,D]: contiguous narrow this rank's seq block (NO zig-zag).
+      const int64_t T = qd[2];
+      if (T % P != 0)
+        throw std::runtime_error("Ulysses: T must be divisible by world_size");
+      const int64_t Tl = T / P;
+      Tensor qc = autograd::contiguous(q);
+      Tensor kc = autograd::contiguous(k);
+      Tensor vc = autograd::contiguous(v);
+      ql = qc.narrow(2, static_cast<int64_t>(rank_) * Tl, Tl).contiguous();
+      kl = kc.narrow(2, static_cast<int64_t>(rank_) * Tl, Tl).contiguous();
+      vl = vc.narrow(2, static_cast<int64_t>(rank_) * Tl, Tl).contiguous();
+    }
+
+    // 2. combine: seq-sharded -> head-sharded full sequence.
+    Tensor qg = cp::ulysses_combine(pg_, ql, P); // [B,Hl,T,D]
+    Tensor kg = cp::ulysses_combine(pg_, kl, P);
+    Tensor vg = cp::ulysses_combine(pg_, vl, P);
+
+    // 3. ONE full square causal SDPA -- reuse existing kernel (no offsets/merge).
+    SDPAResult res = sdpa_fused_forward(qg, kg, vg, /*is_causal=*/true,
+                                        attn_scale_, /*q_offset=*/0,
+                                        /*k_offset=*/0);
+    Tensor out_g = res.out; // [B,Hl,T,D]
+
+    // 4. partition: head-sharded -> seq-sharded local output.
+    Tensor out_l = cp::ulysses_partition(pg_, out_g, P); // [B,H,Tl,D]
+
+    // 5. optional unshard: plain rank-order gather, NO unloadbalance de-zigzag.
+    Tensor output_tensor =
+        unshard ? cp::ulysses_gather_seq(pg_, out_l, P) // [B,H,T,D]
+                : out_l;                                // [B,H,Tl,D]
+
+    // 6. autograd wiring (mirror the ring pattern). The node saves the
+    //    head-sharded tensors + lse; backward re-does the all-to-alls in reverse
+    //    and branches on the persisted unshard flag.
+    if (q.requires_grad() || k.requires_grad() || v.requires_grad()) {
+      auto grad_fn = std::make_shared<UlyssesAttentionBackward>(
+          qg, kg, vg, out_g, res.lse, pg_, attn_scale_, /*is_causal=*/true,
+          world_size_, rank_, unshard, pre_sharded);
+      if (q.requires_grad()) {
+        Tensor &q_mut = const_cast<Tensor &>(q);
+        grad_fn->set_next_edge(0, autograd::get_grad_edge(q_mut));
+      }
+      if (k.requires_grad()) {
+        Tensor &k_mut = const_cast<Tensor &>(k);
+        grad_fn->set_next_edge(1, autograd::get_grad_edge(k_mut));
+      }
+      if (v.requires_grad()) {
+        Tensor &v_mut = const_cast<Tensor &>(v);
+        grad_fn->set_next_edge(2, autograd::get_grad_edge(v_mut));
+      }
+      output_tensor.set_grad_fn(grad_fn);
+      output_tensor.set_requires_grad(true);
+    }
+
+    return output_tensor;
+  }
+
+  // -----------------------------------------------------------------------
+  // forward_ulysses_gqa (additive; reached only from forward_ulysses when
+  // nkv < nq). DeepSpeed Strategy B: the KV all-to-all carries only nkv heads
+  // (comm x1); the grouped broadcast is done LOCALLY (our CP SDPA is MHA-only).
+  // When nkv < P, KV is partially replicated by rep = P/nkv so each rank gets
+  // one KV head -- never expanded all the way to nq (that would be comm x g).
+  // -----------------------------------------------------------------------
+  Tensor forward_ulysses_gqa(Tensor &q, Tensor &k, Tensor &v, bool unshard,
+                             bool pre_sharded) {
+    if (pre_sharded && load_balance_)
+      throw std::runtime_error(
+          "Ulysses GQA: pre_sharded inputs require load_balance=false "
+          "(HeadTail/zig-zag shards would mis-order the gathered sequence).");
+
+    const int P = world_size_;
+    const int64_t nq = q.shape().dims[1];
+    const int64_t nkv = k.shape().dims[1];
+    if (v.shape().dims[1] != nkv)
+      throw std::runtime_error("Ulysses GQA: k/v head counts must match");
+    if (nq % P != 0)
+      throw std::runtime_error("Ulysses GQA: nq must be divisible by world_size");
+    if (nkv == 0 || nq % nkv != 0)
+      throw std::runtime_error("Ulysses GQA: nq must be divisible by nkv");
+    if (!(nkv % P == 0 || P % nkv == 0))
+      throw std::runtime_error(
+          "Ulysses GQA: need (nkv % P == 0) or (P % nkv == 0) (DeepSpeed rule)");
+
+    const int rep = (nkv < P) ? static_cast<int>(P / nkv) : 1;
+
+    // 1. Obtain this rank's contiguous local shards (mirror MHA forward_ulysses).
+    Tensor ql, kl, vl;
+    if (pre_sharded) {
+      ql = autograd::contiguous(q);
+      kl = autograd::contiguous(k);
+      vl = autograd::contiguous(v);
+    } else {
+      const int64_t T = q.shape().dims[2];
+      if (T % P != 0)
+        throw std::runtime_error("Ulysses GQA: T must be divisible by world_size");
+      const int64_t Tl = T / P;
+      Tensor qc = autograd::contiguous(q);
+      Tensor kc = autograd::contiguous(k);
+      Tensor vc = autograd::contiguous(v);
+      ql = qc.narrow(2, static_cast<int64_t>(rank_) * Tl, Tl).contiguous();
+      kl = kc.narrow(2, static_cast<int64_t>(rank_) * Tl, Tl).contiguous();
+      vl = vc.narrow(2, static_cast<int64_t>(rank_) * Tl, Tl).contiguous();
+    }
+
+    // 2. Optional partial replication of KV BEFORE the all-to-all (only nkv < P).
+    Tensor kl_r = cp::head_repeat_interleave(kl, rep); // [B, eff_kv, Tl, D]
+    Tensor vl_r = cp::head_repeat_interleave(vl, rep);
+
+    // 3. combine: Q by nq, KV by eff_kv (separate all-to-alls; KV comm x1).
+    Tensor qg = cp::ulysses_combine(pg_, ql, P);   // [B, nq/P,     T, D]
+    Tensor kg = cp::ulysses_combine(pg_, kl_r, P); // [B, kv_local, T, D]
+    Tensor vg = cp::ulysses_combine(pg_, vl_r, P);
+    const int64_t nq_local = qg.shape().dims[1];
+    const int64_t kv_local = kg.shape().dims[1];
+    const int g_local = static_cast<int>(nq_local / kv_local);
+
+    // 4. Local broadcast kv_local -> nq_local (the "enable_gqa" broadcast, done
+    //    explicitly), then ONE MHA SDPA on the existing kernel.
+    Tensor kg_e = cp::head_repeat_interleave(kg, g_local); // [B, nq/P, T, D]
+    Tensor vg_e = cp::head_repeat_interleave(vg, g_local);
+    SDPAResult res = sdpa_fused_forward(qg, kg_e, vg_e, /*is_causal=*/true,
+                                        attn_scale_, /*q_off=*/0, /*k_off=*/0);
+    Tensor out_g = res.out; // [B, nq/P, T, D]
+
+    // 5. partition Q-shaped output back to seq-sharded local.
+    Tensor out_l = cp::ulysses_partition(pg_, out_g, P); // [B, nq, Tl, D]
+
+    // 6. optional unshard: plain rank-order gather, NO unloadbalance de-zigzag.
+    Tensor output_tensor =
+        unshard ? cp::ulysses_gather_seq(pg_, out_l, P) : out_l;
+
+    // 7. autograd wiring. The node saves UN-expanded kg/vg + group/replication
+    //    params + all three flags (unshard_, pre_sharded_, is_causal_).
+    if (q.requires_grad() || k.requires_grad() || v.requires_grad()) {
+      auto grad_fn = std::make_shared<UlyssesGQAAttentionBackward>(
+          qg, kg, vg, out_g, res.lse, pg_, attn_scale_, /*is_causal=*/true,
+          world_size_, rank_, unshard, pre_sharded, g_local, kv_local, nkv, rep,
+          nq);
+      if (q.requires_grad()) {
+        Tensor &q_mut = const_cast<Tensor &>(q);
+        grad_fn->set_next_edge(0, autograd::get_grad_edge(q_mut));
+      }
+      if (k.requires_grad()) {
+        Tensor &k_mut = const_cast<Tensor &>(k);
+        grad_fn->set_next_edge(1, autograd::get_grad_edge(k_mut));
+      }
+      if (v.requires_grad()) {
+        Tensor &v_mut = const_cast<Tensor &>(v);
+        grad_fn->set_next_edge(2, autograd::get_grad_edge(v_mut));
+      }
+      output_tensor.set_grad_fn(grad_fn);
+      output_tensor.set_requires_grad(true);
+    }
+
+    return output_tensor;
+  }
+
   const DeviceMesh *mesh_;
   std::shared_ptr<ProcessGroupNCCL> pg_;
   float attn_scale_;
@@ -967,6 +1239,18 @@ private:
   int world_size_;
   int rank_;
   HeadTail load_balancer_;
+
+  // Fused-RoPE opt-in (additive; default off => GPT-2/wpe path unchanged).
+  // Set via enable_rope(). When false, none of these are read.
+  bool use_rope_ = false;
+  Tensor cos_sin_cache_;   // [cache_len, hd] cos/sin cache (resident, no grad)
+  Tensor q_gamma_;         // [hd] QK-norm scale (or invalid => skip)
+  Tensor k_gamma_;         // [hd] QK-norm scale (or invalid => skip)
+  float rope_eps_ = 1e-6f;
+
+  // Ulysses opt-in (additive; default off => ring path unchanged). Set via
+  // enable_ulysses(); when true, forward_cp dispatches to forward_ulysses.
+  bool use_ulysses_ = false;
 
   // Persistent forward ring buffers (see Phase 2). Reused across forward_cp
   // calls and reallocated only when the per-rank KV size changes, so the ring
