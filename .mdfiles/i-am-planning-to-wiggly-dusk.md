@@ -202,8 +202,10 @@ Tensor forward_cp(Tensor& q, Tensor& k, Tensor& v, bool unshard, bool pre_sharde
 }
 
 Tensor forward_ulysses(Tensor& q, Tensor& k, Tensor& v, bool unshard, bool pre_sharded) {
-  if (pre_sharded) throw std::runtime_error(
-      "Ulysses v1: pre_sharded unsupported (would accept zig-zag-sharded input); pass full [B,H,T,D]");
+  // NOTE (shipped): pre_sharded is ACCEPTED when this layer is NOT load-balanced
+  // (training feeds contiguous local shards); only the zig-zag combo is rejected.
+  if (pre_sharded && load_balance_) throw std::runtime_error(
+      "Ulysses: pre_sharded requires load_balance=false (zig-zag would mis-order the gather)");
   int P = world_size_;
   // shapes from the FULL tensors (q is [B,H,T,D])
   assert(H % P == 0 && T % P == 0);
@@ -498,4 +500,149 @@ function body changes except the single additive guard line.
 - A **GQA GPT-2 model** in `gpt2_cp_test.cpp` (needs a separate `nkv`-head KV projection — a model
   change beyond CP). GQA here is a CP-layer capability exercised by the parity test; `CP_ATTN_MODE=
   ulysses` training stays MHA.
-- GQA-aware **fused** local kernel (would avoid the explicit expand/reduce) — only if measured worth it.
+- GQA-aware **fused** local kernel (would avoid the explicit expand/reduce) — **now planned; see v3.**
+
+---
+
+# GQA Extension (v3) — call the FUSED GQA kernel (RoPE + QK-norm), Llama-style
+
+## Context
+The team has a **GQA-native fused** attention kernel — `OwnTensor::cuda::gqa_fused_flash_attn_forward`
+/ `..._backward` ([GQA_fused_fwd_sm103.cu](BluTrain/Tensor-Implementations/src/Kernels/cuda/attention/arch/GQA_fused_fwd_sm103.cu),
+`..._bwd_sm103.cu`; decls [AttentionKernels.h:170](BluTrain/Tensor-Implementations/include/ops/helpers/AttentionKernels.h#L170)).
+It does **QK-norm (RMSNorm) + RoPE + causal GQA attention** in one kernel and broadcasts KV internally
+(`hkv = hq/G`). We want the Ulysses GQA path to **call this kernel directly** instead of the v2
+"expand-KV-locally + MHA SDPA" emulation — i.e. a real Llama-style GQA block.
+
+**Why Ulysses makes this clean:** after the combine all-to-all every rank holds the **full contiguous
+sequence `0..T-1`** for its head group, so RoPE is just `pos_offset = 0`, positions `0..T-1` — none of
+the ring's 4-delta position bookkeeping. QK-norm/RoPE run inside the kernel on the gathered Q/K.
+
+**Constraints (fused kernel):** bf16 I/O + packed `[Q|K|V]`; `hd ∈ {64,128}`; `T % 32 == 0`;
+`cache_seq_len ≥ T` (we pass `pos_offset=0`); `Nq % Nkv == 0`. bf16 precision is accepted (per user),
+so parity tolerances are loosened (bf16 ≈ 1e-2).
+
+**Gamma pairing (committed design):** QK-norm gammas are treated as an **all-or-nothing pair** — both
+`q_gamma` and `k_gamma` are valid, or both absent. `enable_ulysses_fused` asserts
+`q_gamma.is_valid() == k_gamma.is_valid()`, and the node uses a single `has_gamma` →
+`Node(has_gamma ? 5 : 3)` with edges 3/4 wired only when `has_gamma`. (This avoids the malformed
+Node(5)-with-one-gamma case; independent per-side gammas are explicitly not supported.)
+
+## STRICTLY ADDITIVE structure
+New opt-in path; v1 MHA and v2 plain-GQA code are untouched.
+- **New** setter `ContextParallel::enable_ulysses_fused(cos_sin_cache, q_gamma, k_gamma, eps=1e-6,
+  interleaved=false)` → sets `use_ulysses_fused_ = true` and stores the cache/gammas/flags.
+- **New** private method `forward_ulysses_fused(...)` reached by **one added guard** at the top of
+  `forward_ulysses` (before the existing `nkv<nq` GQA guard):
+  `if (use_ulysses_fused_) return forward_ulysses_fused(q,k,v,unshard,pre_sharded);`
+  It handles **both** MHA (`nkv==nq`) and GQA (`nkv<nq`) via the GQA-native kernel.
+- **New** node `UlyssesFusedGQAAttentionBackward.h` (calls the fused *backward* kernel; `Node(5)` when
+  gammas are learnable, else `Node(3)`). The v2 `UlyssesGQAAttentionBackward` and MHA node are untouched.
+- Reuse the v2 `head_repeat_interleave` (for the `nkv<P` KV replication) and `head_group_reduce`
+  (for the replication adjoint) from `UlyssesAttention.h` — the **local broadcast is GONE** (kernel does GQA).
+- **New** parity cases (RoPE+QK-norm+GQA reference); existing cases unchanged.
+
+## Forward (`forward_ulysses_fused`)
+```cpp
+const int64_t nq = q.dims[1], nkv = k.dims[1], hd = q.dims[3];
+require(hd==64 || hd==128);  require(T % 32 == 0 for the gathered full T);  // fused-kernel limits
+require(nq % P == 0 && nq % nkv == 0 && (nkv % P == 0 || P % nkv == 0));
+int rep = (nkv < P) ? P/nkv : 1;
+// local contiguous shards ql[B,nq,Tl,D], kl/vl[B,nkv,Tl,D] (narrow or pre_sharded; zig-zag guarded)
+kl_r = head_repeat_interleave(kl, rep);  vl_r = head_repeat_interleave(vl, rep);   // only if nkv<P
+qg = ulysses_combine(pg_, ql,  P);       // [B, nq_local,  T, D]   (T = full gathered seq)
+kg = ulysses_combine(pg_, kl_r,P);       // [B, kv_local,  T, D]
+vg = ulysses_combine(pg_, vl_r,P);
+int nq_local = qg.dims[1], kv_local = kg.dims[1];   // NO local head_repeat_interleave (kernel is GQA-native)
+
+// pack + bf16 (mirror sdpa_gqa_fused, AttentionOps.cpp:392-395)
+packed = Tensor::cat({ qg.contiguous().as_type(Bfloat16).flatten(),
+                       kg.contiguous().as_type(Bfloat16).flatten(),
+                       vg.contiguous().as_type(Bfloat16).flatten() }, 0);
+out_bf = empty([B,nq_local,T,hd], bf16);  lse = empty([B,nq_local,T], f32);
+q_rstd = empty([B,nq_local,T], f32);      k_rstd = empty([B,kv_local,T], f32);
+gqa_fused_flash_attn_forward(packed.data<bf16>(), cos_sin_cache_.data<f32>(),
+    q_gamma_?data:nullptr, k_gamma_?data:nullptr, out_bf.data<bf16>(), lse, q_rstd, k_rstd,
+    B, /*Nq=*/nq_local, /*Nkv=*/kv_local, T, hd,
+    /*cache_seq_len=*/cos_sin_cache_.dims[0], /*pos_offset=*/0, eps_, interleaved_, /*is_causal=*/true);
+
+out_g  = out_bf.as_type(Float32);                 // [B,nq_local,T,hd]
+out_l  = ulysses_partition(pg_, out_g, P);        // [B,nq,Tl,D]
+output = unshard ? ulysses_gather_seq(pg_,out_l,P) : out_l;
+// node saves: packed(bf16), out_bf, lse, q_rstd, k_rstd, q_gamma_/k_gamma_/cos_sin_cache_,
+//   B, nq_local, kv_local, hd, cache_seq_len, eps_, interleaved_, nkv, rep, nq, P, rank_,
+//   unshard_, pre_sharded_, is_causal_(=true).  Node(has_gamma?5:3); edges 0/1/2=q/k/v, 3/4=q/k_gamma.
+```
+
+## Backward (`UlyssesFusedGQAAttentionBackward`)
+```cpp
+grad_out_l = unshard_ ? narrow(grad_out) : grad_out;                 // [B,nq,Tl,D]
+grad_out_g = ulysses_combine(pg_, grad_out_l, P);                    // [B,nq_local,T,D]
+grad_out_bf = grad_out_g.contiguous().as_type(Bfloat16);
+grad_qkv = zeros([qElems+2*kElems], bf16);  D_buf = empty([B,nq_local,T], f32);
+dq_gamma = has_qg ? zeros([hd],f32) : {};   dk_gamma = has_kg ? zeros([hd],f32) : {};
+gqa_fused_flash_attn_backward(packed, cache, qg_ptr, kg_ptr, out_bf, grad_out_bf, lse, q_rstd, k_rstd,
+    grad_qkv.data<bf16>(), dq_gamma?data:nullptr, dk_gamma?data:nullptr, D_buf,
+    B, nq_local, kv_local, T, hd, cache_seq_len, /*pos_offset=*/0, eps_, interleaved_, is_causal_);
+// split (mirror AttentionBackward.cpp:282-287): narrow_view + reshape + as_type(Float32)
+dQg = grad_qkv[0:qElems]        -> [B,nq_local,T,hd] f32
+dKg = grad_qkv[qElems:+kElems]  -> [B,kv_local,T,hd] f32
+dVg = grad_qkv[..]              -> [B,kv_local,T,hd] f32
+dq_l = ulysses_partition(pg_, dQg, P);                               // [B,nq,Tl,D]
+dk_c = ulysses_partition(pg_, dKg, P);                               // [B,eff_kv,Tl,D]
+dv_c = ulysses_partition(pg_, dVg, P);
+dk_l = head_group_reduce(dk_c, nkv, rep);                            // replication adjoint (no-op if rep==1)
+dv_l = head_group_reduce(dv_c, nkv, rep);
+// gamma: shared [hd] param over a HEAD-partitioned axis -> cross-rank SUM (correct even with
+// replication: RMSNorm dgamma is linear in the upstream grad and replicated copies share an
+// identical forward). All-reduce SUM over the CP group so every rank returns the global grad.
+if (has_qg) pg_->all_reduce(dq_gamma.data<f32>(), dq_gamma.data<f32>(), hd, Float32, op_t::sum, true);
+if (has_kg) pg_->all_reduce(dk_gamma.data<f32>(), dk_gamma.data<f32>(), hd, Float32, op_t::sum, true);
+// return shape = upstream edge shape, branch on the PERSISTED pre_sharded_:
+if (pre_sharded_) {
+  gq = dq_l; gk = dk_l; gv = dv_l;                         // LOCAL, no gather
+} else {
+  // PLAIN rank-order gather (ulysses_gather_seq), NOT the ring unshard helper:
+  // it must UNCONDITIONALLY skip unloadbalance/de-zigzag (identical carve-out to
+  // v1/v2 — a nearby ring gather would re-zigzag and silently corrupt grads).
+  gq = ulysses_gather_seq(pg_, dq_l, P);                   // q by nq heads
+  gk = ulysses_gather_seq(pg_, dk_l, P);                   // k/v by nkv heads
+  gv = ulysses_gather_seq(pg_, dv_l, P);
+}
+return has_gamma ? {gq, gk, gv, dq_gamma, dk_gamma} : {gq, gk, gv};
+```
+No local group-reduce over `g_local` (the kernel already returns `dK/dV` at `kv_local` heads, summed
+over the group internally). The only head-reduce is the `nkv<P` **replication** adjoint (`rep`).
+
+**Gamma-grad caveat (documented):** the node all-reduces `dq/dk_gamma` (SUM) so it returns the *global*
+grad — correct for the parity test and self-contained. A future real Llama+Ulysses training must not
+*also* all-reduce these gammas across the same CP group (double count); it would return local partials
+and rely on the external param all-reduce instead. Out of scope here (test-only).
+
+## Files (all additive)
+| File | Change |
+|---|---|
+| `context_parallel/UlyssesFusedGQAAttentionBackward.h` | **NEW** — node calling `gqa_fused_flash_attn_backward` (bf16 pack/split, gamma SUM all-reduce, replication adjoint, partition, gather/local). |
+| `context_parallel/ContextParallel.h` | **+** `use_ulysses_fused_` + `cos_sin_cache_fused_`/`q_gamma_f_`/`k_gamma_f_`/`eps_f_`/`interleaved_f_` members; **+** `enable_ulysses_fused(...)` setter; **+** `forward_ulysses_fused(...)`; **+** one guard line atop `forward_ulysses`; **+** include. Existing bodies unchanged. |
+| `context_parallel/UlyssesAttention.h` | reused as-is (`head_repeat_interleave`, `head_group_reduce`, combine/partition/gather). **No change.** |
+| `Tests/cp_ulysses_parity.cpp` | **+** fused RoPE+QK-norm+GQA cases (new function `run_fused_mode`). Existing cases unchanged. |
+
+## Verification
+- **Parity** — new `run_fused_mode` (ws=2; hd=64, T=64 so `hd∈{64,128}`, `T%32==0` hold):
+  - Reference (single-GPU, fp32): `qr = rope(rms_norm(q, q_gamma, hd, eps))`,
+    `kr = rope(rms_norm(k, k_gamma, hd, eps))` (interleaved=false, offset 0), expand `kr/vr` to `nq`
+    via `head_repeat_interleave`, causal `ref_sdpa`. gammas are leaves. Build the SAME `cos_sin_cache`.
+  - CP: `cp.enable_ulysses_fused(cache, q_gamma, k_gamma)`; `forward_cp(q,k,v)`. Backward on ones.
+  - Compare forward + dQ/dK/dV + dq_gamma/dk_gamma. **Loosen tolerance for bf16** (e.g. `cos>0.99`,
+    maxdiff ~1e-2). dK/dV reference reduced to `[B,nkv]` by the same group-sum; gamma refs are `[hd]`.
+  - Cases: MHA-fused `nq=nkv=8`, GQA `nq=8,nkv=2`, MQA `nq=8,nkv=1` (rep=2). ws=4 configs mirror v2
+    (`nq=16,nkv∈{4,1}`) — mandatory axis coverage, needs a 4-GPU box (device mapping already
+    oversubscription-safe).
+- **Regression**: v1 MHA + v2 plain-GQA Ulysses parity and ring `run-cp-rope-standin` all still green
+  (fused path is reached only via `enable_ulysses_fused`).
+
+## Out of scope (v3)
+- Wiring the fused path into `gpt2_cp_test.cpp` (needs a Llama-style GQA+RoPE+QK-norm model with a
+  separate nkv KV projection and per-layer gammas — a model build beyond CP).
+- Reconciling the in-node gamma SUM all-reduce with an external param all-reduce for real training.
+- `hd` outside {64,128} (fused kernel only compiles those).

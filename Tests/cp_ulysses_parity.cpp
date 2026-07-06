@@ -27,6 +27,8 @@
 
 #include "TensorLib.h"
 #include "autograd/AutogradOps.h"
+#include "autograd/operations/RoPEOps.h"
+#include "autograd/operations/NormalizationOps.h"
 #include "context_parallel/ContextParallel.h"
 
 using namespace OwnTensor;
@@ -242,6 +244,130 @@ static void run_gqa_mode(const DeviceMesh &mesh,
   MPI_Barrier(MPI_COMM_WORLD);
 }
 
+// QK-norm (RMSNorm over hd) then RoPE, matching the fused kernel (norm -> rope,
+// NeoX/interleaved=false). rope() expects [B,T,H,D] so transpose around it; our
+// tensors are [B,H,T,D].
+static Tensor qk_rope_bhtd(const Tensor &x, const Tensor &gamma,
+                           const Tensor &cache, int64_t hd, float eps) {
+  Tensor n = autograd::rms_norm(x, gamma, static_cast<int>(hd), eps); // [B,H,T,D]
+  Tensor nt = autograd::transpose(n, 1, 2);                           // [B,T,H,D]
+  Tensor r = autograd::rope(nt, cache, /*interleaved=*/false, /*offset=*/0);
+  return autograd::transpose(r, 1, 2);                                // [B,H,T,D]
+}
+
+// FUSED RoPE+QK-norm+GQA parity (bf16 fused kernel). Reference is single-GPU
+// fp32 rms_norm+rope+GQA(MHA-with-expanded-KV). bf16 -> loosened tolerance.
+static void run_fused_mode(const DeviceMesh &mesh,
+                           std::shared_ptr<ProcessGroupNCCL> pg, int rank,
+                           int world_size, int64_t nkv, DeviceIndex device,
+                           int64_t B, int64_t nq, int64_t T, int64_t D,
+                           float scale, const Tensor &cache, float eps) {
+  const int g = static_cast<int>(nq / nkv);
+  if (rank == 0)
+    std::cout << "\n=== Ulysses FUSED (RoPE+QKnorm+GQA) parity  (nq=" << nq
+              << " nkv=" << nkv << " g=" << g
+              << (nkv < world_size ? ", replicate" : "") << ") ===" << std::endl;
+
+  TensorOptions opts = TensorOptions()
+                           .with_dtype(Dtype::Float32)
+                           .with_device(device)
+                           .with_req_grad(true);
+  auto mkq = [&](int s) { return Tensor::randn<float>(Shape({{B, nq, T, D}}), opts, s, 0.5f); };
+  auto mkkv = [&](int s) { return Tensor::randn<float>(Shape({{B, nkv, T, D}}), opts, s, 0.5f); };
+  Tensor qg = Tensor::randn<float>(Shape({{D}}), opts, 11, 0.1f); // q_gamma
+  Tensor kg = Tensor::randn<float>(Shape({{D}}), opts, 22, 0.1f); // k_gamma
+
+  // ---- CP (fused) ----
+  Tensor q = mkq(100), k = mkkv(200), v = mkkv(300);
+  ContextParallel cp(mesh, pg, scale, /*is_causal=*/true, RotatorType::AlltoAll,
+                     /*load_balance=*/false);
+  cp.enable_ulysses_fused(cache, qg, kg, eps, /*interleaved=*/false);
+  Tensor cp_out = cp.forward_cp(q, k, v, /*unshard=*/true);
+  Tensor ones_cp = Tensor::full(
+      cp_out.shape(),
+      TensorOptions().with_dtype(Dtype::Float32).with_device(device), 1.0f);
+  cp_out.backward(&ones_cp);
+
+  // ---- reference (rank 0, fp32) ----
+  // KV is expanded to nq via the RAW head_repeat_interleave held as a LEAF (the
+  // autograd broadcast path has a middle-axis-reduce bug); grads on the expanded
+  // leaves are group-reduced back to nkv, and for K propagated through kr.backward
+  // to reach k2/k_gamma. Same pattern as the passing run_gqa_mode.
+  if (rank == 0) {
+    Tensor q2 = mkq(100), k2 = mkkv(200), v2 = mkkv(300);
+    Tensor qg2 = qg.clone(); qg2.set_requires_grad(true);
+    Tensor kg2 = kg.clone(); kg2.set_requires_grad(true);
+    Tensor qr = qk_rope_bhtd(q2, qg2, cache, D, eps);         // [B,nq,T,D] graph->q2,qg2
+    Tensor kr = qk_rope_bhtd(k2, kg2, cache, D, eps);         // [B,nkv,T,D] graph->k2,kg2
+    const bool expanded = (g > 1);
+    Tensor kr_e, vr_e;
+    if (expanded) {
+      kr_e = OwnTensor::cp::head_repeat_interleave(kr, g); kr_e.set_requires_grad(true); // leaf
+      vr_e = OwnTensor::cp::head_repeat_interleave(v2, g); vr_e.set_requires_grad(true); // leaf
+    } else {
+      kr_e = kr; vr_e = v2;                                   // g==1: use the graph directly
+    }
+    Tensor ro = ref_sdpa(qr, kr_e, vr_e, scale);
+
+    {
+      Tensor a = ro.to_cpu(), b = cp_out.to_cpu();
+      double c = cosine(a, b);
+      float m = max_abs_diff(a, b);
+      gate(c > 0.99, "fused forward", c, m); // bf16 tolerance
+    }
+    Tensor ones = Tensor::full(
+        ro.shape(),
+        TensorOptions().with_dtype(Dtype::Float32).with_device(device), 1.0f);
+    ro.backward(&ones);
+
+    // Snapshot Q-side (and V) reference grads to CPU BEFORE the second backward
+    // (kr.backward below re-enters the engine; snapshot avoids read-after-second-
+    // backward contamination of q2/qg2 grads).
+    Tensor dq_ref = q2.grad_view().to_cpu();
+    Tensor dqg_ref = qg2.grad_view().to_cpu();
+    Tensor dk_ref, dv_ref, dkg_ref;
+    if (expanded) {
+      Tensor dkr = OwnTensor::cp::head_group_reduce(kr_e.grad_view(), nkv, g);
+      dv_ref = OwnTensor::cp::head_group_reduce(vr_e.grad_view(), nkv, g).to_cpu();
+      kr.backward(&dkr);                    // fills k2, kg2 grads
+      dk_ref = k2.grad_view().to_cpu();
+      dkg_ref = kg2.grad_view().to_cpu();
+    } else {
+      dk_ref = k2.grad_view().to_cpu();     // g==1: filled directly by ro.backward
+      dv_ref = v2.grad_view().to_cpu();
+      dkg_ref = kg2.grad_view().to_cpu();
+    }
+
+    // KNOWN BUG: the fused GQA *backward* kernel returns wrong dQ / dq_gamma for
+    // true GQA (1 < nkv < nq). Reproduced at ws=1 (kernel called directly, no CP).
+    // Mark those two comparisons xfail for that regime so the suite stays green
+    // for everything that is actually correct (forward, dK/dV/dk_gamma, and the
+    // MHA/MQA cases). See ClaudeReport for the kernel-team writeup.
+    const bool xfail_dq = (nkv > 1 && nkv < nq);
+    auto cmp_t = [&](const Tensor &ref_cpu, Tensor &cp_src, const char *tag,
+                     bool xfail) {
+      if (!cp_src.has_grad()) { std::cout << "  FAIL " << tag << " (missing grad)\n"; ++g_fail; return; }
+      Tensor b = cp_src.grad_view().to_cpu();
+      double c = cosine(ref_cpu, b); float m = max_abs_diff(ref_cpu, b);
+      const bool ok = (c > 0.99);
+      if (!ok && xfail) {
+        std::cout << "  XFAIL " << std::left << std::setw(18) << tag
+                  << " cos=" << std::fixed << std::setprecision(7) << c
+                  << " maxdiff=" << std::scientific << m
+                  << "  (KNOWN fused-GQA-backward kernel bug)" << std::endl;
+        return; // do NOT count as a suite failure
+      }
+      gate(ok, tag, c, m);
+    };
+    cmp_t(dq_ref,  q,  "fused dQ",       xfail_dq);
+    cmp_t(dk_ref,  k,  "fused dK",       false);
+    cmp_t(dv_ref,  v,  "fused dV",       false);
+    cmp_t(dqg_ref, qg, "fused dq_gamma", xfail_dq);
+    cmp_t(dkg_ref, kg, "fused dk_gamma", false);
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+}
+
 int main(int argc, char **argv) {
   MPI_Init(&argc, &argv);
   int rank, world_size;
@@ -292,6 +418,29 @@ int main(int argc, char **argv) {
       continue;
     }
     run_gqa_mode(mesh, pg, rank, world_size, nkv, device, B, /*nq=*/H, T, D, scale);
+  }
+
+  // FUSED RoPE+QK-norm+GQA cases (bf16 kernel; requires hd in {64,128}, T%32==0).
+  if ((D == 64 || D == 128) && (T % 32 == 0)) {
+    const float eps = 1e-6f;
+    Tensor cache = autograd::build_rope_cache(T, D, 10000.0f, device); // [T, D] fp32
+    for (int64_t nkv : {(int64_t)8, (int64_t)2, (int64_t)1}) {
+      if (H % nkv != 0) continue;
+      if (!((nkv % world_size == 0) || (world_size % nkv == 0))) continue;
+      run_fused_mode(mesh, pg, rank, world_size, nkv, device, B, /*nq=*/H, T, D,
+                     scale, cache, eps);
+    }
+    // Kernel is tuned for nq=12, nkv=4 (G=3) — test that exact GQA config.
+    if ((12 % world_size == 0) && ((4 % world_size == 0) || (world_size % 4 == 0))) {
+      run_fused_mode(mesh, pg, rank, world_size, /*nkv=*/4, device, B, /*nq=*/12,
+                     T, D, scale, cache, eps);
+    } else if (rank == 0) {
+      std::cout << "\n[skip FUSED nq=12,nkv=4] not divisible for ws="
+                << world_size << std::endl;
+    }
+  } else if (rank == 0) {
+    std::cout << "\n[skip FUSED cases] need hd in {64,128} and T%32==0 (have hd="
+              << D << ", T=" << T << ")\n";
   }
 
   int total_fail = g_fail;

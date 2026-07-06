@@ -38,6 +38,7 @@
 #include "context_parallel/SDPAOp.h"
 
 #include <cuda_runtime.h>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -130,6 +131,16 @@ inline SDPAResult sdpa_fused_forward(Tensor &q, Tensor &k, Tensor &v,
   // Parity test: ATTN_FP32=1 forces the scalar fp32 attention kernel (no TF32
   // WMMA) to isolate whether the C++<->PT attention gap is TF32-vs-fp32.
   static const bool attn_fp32 = (std::getenv("ATTN_FP32") != nullptr);
+  {
+    // One-time confirmation of the active forward attention path (mirrors the
+    // [CP ring ...] prints). Set ATTN_FP32 (any value) to force the scalar fp32
+    // kernel; UNSET to use the TF32 WMMA/cp.async TC path.
+    static bool _fp32_once = false;
+    if (!_fp32_once) { _fp32_once = true;
+      fprintf(stderr, "[CP sdpa fwd] %s\n", attn_fp32
+          ? "ATTN_FP32=on -> scalar fp32 kernel (no cp.async/WMMA)"
+          : "ATTN_FP32=off -> TF32 WMMA/cp.async TC kernel"); }
+  }
   if (attn_fp32) {
     OwnTensor::cp::cuda::mem_efficient_attn_forward_strided(
       Q_ptr, q_sB, q_sM, q_sH,

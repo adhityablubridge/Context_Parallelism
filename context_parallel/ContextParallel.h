@@ -21,6 +21,7 @@
 #include "context_parallel/UlyssesAttention.h"        // Ulysses all-to-all layout transforms (additive)
 #include "context_parallel/UlyssesAttentionBackward.h" // Ulysses backward node (additive)
 #include "context_parallel/UlyssesGQAAttentionBackward.h" // Ulysses GQA backward node (additive)
+#include "context_parallel/UlyssesFusedGQAAttentionBackward.h" // Ulysses fused RoPE+QKnorm+GQA node (additive)
 
 #include <atomic>
 #include <cmath>
@@ -240,6 +241,28 @@ public:
   // v1: MHA only (H % world_size == 0), contiguous sharding (no HeadTail),
   // blocking all-to-all. pre_sharded inputs are rejected (see forward_ulysses).
   void enable_ulysses() { use_ulysses_ = true; }
+
+  // Opt this CP layer into the FUSED GQA Ulysses path (additive; Llama-style):
+  // RoPE + QK-norm + GQA are done INSIDE the team's gqa_fused_flash_attn kernel
+  // (bf16). Reached only when use_ulysses_ is also set (forward_ulysses dispatches
+  // to forward_ulysses_fused first). Gammas are all-or-nothing: pass BOTH q_gamma
+  // and k_gamma valid, or BOTH invalid (QK-norm off). cache: [cache_len>=T, hd]
+  // fp32 cos/sin from autograd::build_rope_cache.
+  void enable_ulysses_fused(const Tensor &cos_sin_cache, const Tensor &q_gamma,
+                            const Tensor &k_gamma, float eps = 1e-6f,
+                            bool interleaved = false) {
+    if (q_gamma.is_valid() != k_gamma.is_valid())
+      throw std::runtime_error(
+          "enable_ulysses_fused: q_gamma and k_gamma must both be valid or both "
+          "invalid (gammas are an all-or-nothing pair)");
+    cos_sin_cache_f_ = cos_sin_cache;
+    q_gamma_f_ = q_gamma;
+    k_gamma_f_ = k_gamma;
+    eps_f_ = eps;
+    interleaved_f_ = interleaved;
+    use_ulysses_fused_ = true;
+    use_ulysses_ = true; // route forward_cp -> forward_ulysses -> fused
+  }
 
   // -----------------------------------------------------------------------
   // forward
@@ -1035,6 +1058,11 @@ private:
   // -----------------------------------------------------------------------
   Tensor forward_ulysses(Tensor &q, Tensor &k, Tensor &v, bool unshard,
                          bool pre_sharded) {
+    // Fused RoPE+QK-norm+GQA dispatch (additive gate): when enabled, use the
+    // team's GQA-native fused kernel (handles both MHA and GQA). Checked first.
+    if (use_ulysses_fused_)
+      return forward_ulysses_fused(q, k, v, unshard, pre_sharded);
+
     // GQA/MQA dispatch (additive gate): when KV has fewer heads than Q, take the
     // separate GQA path. MHA (equal head counts) falls through to the unchanged
     // body below.
@@ -1229,6 +1257,134 @@ private:
     return output_tensor;
   }
 
+  // -----------------------------------------------------------------------
+  // forward_ulysses_fused (additive; reached only via enable_ulysses_fused()).
+  // Llama-style: RoPE + QK-norm + GQA are fused INSIDE the team's bf16
+  // gqa_fused_flash_attn kernel. The kernel is GQA-native (broadcasts KV by
+  // hkv=hq/G), so there is NO local head broadcast; only the nkv<P replication
+  // (for the all-to-all distribution) remains. After the combine gather each
+  // rank holds the full contiguous sequence -> pos_offset = 0.
+  // -----------------------------------------------------------------------
+  Tensor forward_ulysses_fused(Tensor &q, Tensor &k, Tensor &v, bool unshard,
+                               bool pre_sharded) {
+    if (pre_sharded && load_balance_)
+      throw std::runtime_error(
+          "Ulysses fused: pre_sharded requires load_balance=false (zig-zag "
+          "would mis-order the gathered sequence).");
+
+    const int P = world_size_;
+    const int64_t nq = q.shape().dims[1];
+    const int64_t nkv = k.shape().dims[1];
+    const int64_t hd = q.shape().dims[3];
+    if (hd != 64 && hd != 128)
+      throw std::runtime_error("Ulysses fused: fused kernel supports hd 64 or 128 only");
+    if (v.shape().dims[1] != nkv)
+      throw std::runtime_error("Ulysses fused: k/v head counts must match");
+    if (nq % P != 0)
+      throw std::runtime_error("Ulysses fused: nq must be divisible by world_size");
+    if (nkv == 0 || nq % nkv != 0)
+      throw std::runtime_error("Ulysses fused: nq must be divisible by nkv");
+    if (!(nkv % P == 0 || P % nkv == 0))
+      throw std::runtime_error(
+          "Ulysses fused: need (nkv % P == 0) or (P % nkv == 0) (DeepSpeed rule)");
+
+    const int rep = (nkv < P) ? static_cast<int>(P / nkv) : 1;
+    const bool has_gamma = q_gamma_f_.is_valid() && k_gamma_f_.is_valid();
+
+    // 1. local contiguous shards.
+    Tensor ql, kl, vl;
+    if (pre_sharded) {
+      ql = autograd::contiguous(q);
+      kl = autograd::contiguous(k);
+      vl = autograd::contiguous(v);
+    } else {
+      const int64_t T = q.shape().dims[2];
+      if (T % P != 0)
+        throw std::runtime_error("Ulysses fused: T must be divisible by world_size");
+      const int64_t Tl = T / P;
+      Tensor qc = autograd::contiguous(q);
+      Tensor kc = autograd::contiguous(k);
+      Tensor vc = autograd::contiguous(v);
+      ql = qc.narrow(2, static_cast<int64_t>(rank_) * Tl, Tl).contiguous();
+      kl = kc.narrow(2, static_cast<int64_t>(rank_) * Tl, Tl).contiguous();
+      vl = vc.narrow(2, static_cast<int64_t>(rank_) * Tl, Tl).contiguous();
+    }
+
+    // 2. optional partial KV replication (nkv < P) before the all-to-all.
+    Tensor kl_r = cp::head_repeat_interleave(kl, rep);
+    Tensor vl_r = cp::head_repeat_interleave(vl, rep);
+
+    // 3. combine: Q by nq, KV by eff_kv. No local broadcast (kernel is GQA-native).
+    Tensor qg = cp::ulysses_combine(pg_, ql, P);   // [B, nq_local,  T, D]
+    Tensor kg = cp::ulysses_combine(pg_, kl_r, P); // [B, kv_local,  T, D]
+    Tensor vg = cp::ulysses_combine(pg_, vl_r, P);
+    const int64_t nq_local = qg.shape().dims[1];
+    const int64_t kv_local = kg.shape().dims[1];
+    const int64_t B = qg.shape().dims[0];
+    const int64_t T = qg.shape().dims[2];
+
+    // 4. pack + bf16 (mirror sdpa_gqa_fused), run the fused kernel.
+    Tensor packed = Tensor::cat({qg.contiguous().as_type(Dtype::Bfloat16).flatten(),
+                                 kg.contiguous().as_type(Dtype::Bfloat16).flatten(),
+                                 vg.contiguous().as_type(Dtype::Bfloat16).flatten()},
+                                0);
+    TensorOptions bf = qg.opts().with_dtype(Dtype::Bfloat16).with_req_grad(false);
+    TensorOptions fp = qg.opts().with_dtype(Dtype::Float32).with_req_grad(false);
+    Tensor out_bf = Tensor::empty(Shape({{B, nq_local, T, hd}}), bf);
+    Tensor lse    = Tensor::empty(Shape({{B, nq_local, T}}), fp);
+    Tensor q_rstd = Tensor::empty(Shape({{B, nq_local, T}}), fp);
+    Tensor k_rstd = Tensor::empty(Shape({{B, kv_local, T}}), fp);
+    const int cache_seq_len = static_cast<int>(cos_sin_cache_f_.shape().dims[0]);
+
+    OwnTensor::cuda::gqa_fused_flash_attn_forward(
+        packed.data<bfloat16_t>(), cos_sin_cache_f_.data<float>(),
+        has_gamma ? q_gamma_f_.data<float>() : nullptr,
+        has_gamma ? k_gamma_f_.data<float>() : nullptr,
+        out_bf.data<bfloat16_t>(), lse.data<float>(), q_rstd.data<float>(),
+        k_rstd.data<float>(), static_cast<int>(B), static_cast<int>(nq_local),
+        static_cast<int>(kv_local), static_cast<int>(T), static_cast<int>(hd),
+        cache_seq_len, /*pos_offset=*/0, eps_f_, interleaved_f_, /*is_causal=*/true);
+
+    Tensor out_g = out_bf.as_type(Dtype::Float32);       // [B, nq_local, T, hd]
+
+    // 5. partition Q-shaped output back; 6. optional plain unshard.
+    Tensor out_l = cp::ulysses_partition(pg_, out_g, P); // [B, nq, Tl, D]
+    Tensor output_tensor =
+        unshard ? cp::ulysses_gather_seq(pg_, out_l, P) : out_l;
+
+    // 7. autograd wiring.
+    if (q.requires_grad() || k.requires_grad() || v.requires_grad() ||
+        (has_gamma && (q_gamma_f_.requires_grad() || k_gamma_f_.requires_grad()))) {
+      auto grad_fn = std::make_shared<UlyssesFusedGQAAttentionBackward>(
+          packed, out_bf, lse, q_rstd, k_rstd, cos_sin_cache_f_, q_gamma_f_,
+          k_gamma_f_, pg_, /*is_causal=*/true, world_size_, rank_, unshard,
+          pre_sharded, B, nq_local, kv_local, hd, cache_seq_len, eps_f_,
+          interleaved_f_, nkv, rep, nq);
+      if (q.requires_grad()) {
+        Tensor &q_mut = const_cast<Tensor &>(q);
+        grad_fn->set_next_edge(0, autograd::get_grad_edge(q_mut));
+      }
+      if (k.requires_grad()) {
+        Tensor &k_mut = const_cast<Tensor &>(k);
+        grad_fn->set_next_edge(1, autograd::get_grad_edge(k_mut));
+      }
+      if (v.requires_grad()) {
+        Tensor &v_mut = const_cast<Tensor &>(v);
+        grad_fn->set_next_edge(2, autograd::get_grad_edge(v_mut));
+      }
+      if (has_gamma) {
+        if (q_gamma_f_.requires_grad())
+          grad_fn->set_next_edge(3, autograd::get_grad_edge(q_gamma_f_));
+        if (k_gamma_f_.requires_grad())
+          grad_fn->set_next_edge(4, autograd::get_grad_edge(k_gamma_f_));
+      }
+      output_tensor.set_grad_fn(grad_fn);
+      output_tensor.set_requires_grad(true);
+    }
+
+    return output_tensor;
+  }
+
   const DeviceMesh *mesh_;
   std::shared_ptr<ProcessGroupNCCL> pg_;
   float attn_scale_;
@@ -1251,6 +1407,16 @@ private:
   // Ulysses opt-in (additive; default off => ring path unchanged). Set via
   // enable_ulysses(); when true, forward_cp dispatches to forward_ulysses.
   bool use_ulysses_ = false;
+
+  // Fused RoPE+QK-norm+GQA Ulysses opt-in (additive; default off). Set via
+  // enable_ulysses_fused(); when true forward_ulysses dispatches to the fused
+  // path. Gammas are all-or-nothing (both valid or both invalid).
+  bool use_ulysses_fused_ = false;
+  Tensor cos_sin_cache_f_; // [cache_len, hd] fp32 cos/sin (resident, no grad)
+  Tensor q_gamma_f_;       // [hd] QK-norm scale (both valid or both invalid)
+  Tensor k_gamma_f_;
+  float eps_f_ = 1e-6f;
+  bool interleaved_f_ = false;
 
   // Persistent forward ring buffers (see Phase 2). Reused across forward_cp
   // calls and reallocated only when the per-rank KV size changes, so the ring

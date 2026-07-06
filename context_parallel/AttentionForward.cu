@@ -1,6 +1,7 @@
 #include "ops/helpers/AttentionKernels.h"
 #include "ops/helpers/KernelDispatch.h"
 #include "ops/cuda/attention/AttentionCommon.cuh"
+#include <cstdlib>  // std::getenv (CP_FWD_TI_SM89 gate)
 
 // ============================================================================
 // Context-Parallel aware copy of Tensor-Implementations AttentionForward.
@@ -984,10 +985,17 @@ void mem_efficient_attn_forward_tc_strided(
 
     int grid_y = (int)(B * nh);
 
-    // TI sm89 (Ada Lovelace) kernel now accepts strided I/O directly. It still
-    // requires T_q == T_k and q_offset == k_offset == 0 (no cross-rank causal
-    // sub-chunking), so dispatch only when those CP conditions are met.
-    if (T_q == T_k && q_offset == 0 && k_offset == 0 &&
+    // TI sm89 (Ada) kernel is a faster square-case path, BUT it ends its KV loop
+    // with an unconditional cp.async.wait_group<1>, so on the final KV tile it
+    // does NOT wait for the V copy. Benign under exclusive occupancy, but under CP
+    // compute/comm OVERLAP the ring NCCL kernel delays that copy and P@V reads a
+    // not-yet-arrived V tile -> intermittent corruption -> grad-norm explosion
+    // (world_size>=3, overlap on). We cannot patch the TI kernel here, so by
+    // DEFAULT route the square case to the CP kernel (fused_attn_forward_kernel_tc,
+    // which has the has_next-guarded wait and handles square fine). Opt back into
+    // the TI fast path with CP_FWD_TI_SM89=1 (safe only without forward overlap).
+    static const bool use_ti_sm89 = (std::getenv("CP_FWD_TI_SM89") != nullptr);
+    if (use_ti_sm89 && T_q == T_k && q_offset == 0 && k_offset == 0 &&
         ::OwnTensor::cuda::get_arch() == ::OwnTensor::cuda::ArchFamily::Ada) {
         ::OwnTensor::fused_attn_forward_tc_sm89_cuda(
             query, key, value, output, lse,

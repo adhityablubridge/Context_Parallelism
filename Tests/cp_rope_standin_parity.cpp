@@ -160,7 +160,10 @@ int main(int argc, char** argv) {
   int rank, world_size;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-  cudaSetDevice(rank);
+  // Tolerate oversubscription (e.g. ws=4 on 2 GPUs) so the ring's deep-pipeline
+  // path (world_size>=3, per-step slot reuse) can be validated on fewer GPUs.
+  int _ndev = 0; cudaGetDeviceCount(&_ndev);
+  cudaSetDevice(_ndev > 0 ? (rank % _ndev) : 0);
 
   std::vector<int> ranks(world_size);
   for (int i = 0; i < world_size; ++i) ranks[i] = i;

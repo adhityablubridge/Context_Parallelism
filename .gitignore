@@ -30,3 +30,5 @@ BluTrain/
 
 # Legacy top-level submodule path (Tensor-Implementations now lives under BluTrain/)
 Tensor-Implementations/
+
+.mdfiles/
