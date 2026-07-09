@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,7 @@ public:
 #include "autograd/operations/EmbeddingOps.h"
 #include "autograd/operations/LossOps.h"
 #include "checkpointing/GradMode.h"
+#include "checkpointing/Checkpointing.h"
 // #include "dnn/DistributedNN.h"
 #include "mlp/activation.h"
 #include "nn/NN.h"
@@ -91,6 +93,9 @@ struct GPTConfig {
   // Recompute K in the ring backward instead of storing all ring-step K
   // buffers (trades compute for memory; PyTorch CP recomputes by default).
   bool recompute_k = false;
+  // Disk-state checkpointing: periodically save model+optimizer state to
+  // cp_checkpoints/ and auto-resume from the latest checkpoint on restart.
+  bool checkpointing = false;
 };
 
 // =============================================================================
@@ -692,6 +697,17 @@ int main(int argc, char **argv) {
       config.recompute_k = (e[0] == '1');
     }
 
+    // Disk-state checkpointing (CP_CKPT=1): periodic save + auto-resume.
+    if (const char *e = std::getenv("CP_CKPT")) {
+      config.checkpointing = (e[0] == '1');
+    }
+    // Force a brand-new run number even if resumable checkpoints exist.
+    const bool ckpt_new_run =
+        std::getenv("CP_CKPT_NEW_RUN") && std::getenv("CP_CKPT_NEW_RUN")[0] == '1';
+    // Resume a specific run number (>=0); -1 = not requested (auto-resume latest).
+    int ckpt_resume_run = -1;
+    if (const char *e = std::getenv("CP_CKPT_RESUME")) ckpt_resume_run = atoi(e);
+
     // Attention mode: CP_ATTN_MODE=ulysses switches every CP layer to the
     // DeepSpeed-style Ulysses all-to-all path (the layers read the same env in
     // their ctor and call enable_ulysses()). Ulysses requires CONTIGUOUS
@@ -727,6 +743,9 @@ int main(int argc, char **argv) {
     const float min_lr = max_lr * 0.1f;
     const int VAL_FREQ = 100;
     const int TOK_GEN_FREQ = 100;
+    // Checkpoint save cadence (steps). Default matches gpt2_fmha_ddp.cpp.
+    int CKPT_FREQ = 5000;
+    if (const char *e = std::getenv("CP_CKPT_FREQ")) CKPT_FREQ = atoi(e);
 
     // int max_steps    = (static_cast<int>(num_params) / global_batch ) * 5;
     int max_steps = fourtyfour?6768:1555;
@@ -753,6 +772,9 @@ int main(int argc, char **argv) {
       std::cout << "  n_heads: " << config.n_heads << "\n";
       std::cout << "  B=" << B << ", T=" << T << "\n";
       std::cout << "  world_size: " << world_size << "\n";
+      std::cout << "  checkpointing: " << (config.checkpointing ? 1 : 0) << "\n";
+      if (config.checkpointing)
+        std::cout << "  ckpt_freq: " << CKPT_FREQ << "\n";
     }
 
     // Device + Process Group
@@ -953,21 +975,102 @@ int main(int argc, char **argv) {
     std::string log_filename, config_filename;
     std::ofstream log_file;
 
+    // Run number governs BOTH the CSV log index and the checkpoint filename
+    // prefix (gpt2_cp_run<run_number>_step_<N>.ckpt). Resolved on rank 0 (needs
+    // filesystem scans), then broadcast so every rank builds the same prefix.
+    // When resuming, run_number is kept (log is appended, not re-indexed).
+    int run_number = 0;
+    bool ckpt_resuming = false;  // rank-0 decision; broadcast below
+
     if (rank == 0) {
       std::filesystem::create_directories("CP_Training_logs");
-      int log_idx = 1;
-      while (true) {
-        log_filename = "CP_Training_logs/CP_Training_log" +
-                       std::to_string(log_idx) + ".csv";
-        if (!std::filesystem::exists(log_filename))
-          break;
-        log_idx++;
+      // First free CP_Training_log{N}.csv index (used for a fresh run).
+      int next_free_log = 1;
+      while (std::filesystem::exists("CP_Training_logs/CP_Training_log" +
+                                     std::to_string(next_free_log) + ".csv")) {
+        next_free_log++;
       }
-      std::cout << "Saving logs to: " << log_filename << "\n";
+
+      // ── Resolve the checkpoint run to resume (tied to the log index) ────────
+      // Scan cp_checkpoints/ for gpt2_cp_run<K>_step_<S>.ckpt, tracking each
+      // run's highest step. A run is "complete" if its top step >= max_steps-1.
+      int resume_run = -1;       // chosen run to resume (-1 = none)
+      int resume_top_step = -1;  // its highest saved step
+      if (config.checkpointing && !ckpt_new_run) {
+        std::map<int, int> run_top_step;  // run K -> highest step S
+        if (std::filesystem::exists("cp_checkpoints")) {
+          for (const auto &de :
+               std::filesystem::directory_iterator("cp_checkpoints")) {
+            if (!de.is_regular_file()) continue;
+            const std::string fn = de.path().filename().string();
+            // Match "gpt2_cp_run<K>_step_<S>.ckpt".
+            const std::string p1 = "gpt2_cp_run", p2 = "_step_", p3 = ".ckpt";
+            if (fn.rfind(p1, 0) != 0) continue;
+            size_t spos = fn.find(p2);
+            if (spos == std::string::npos) continue;
+            if (fn.size() < p3.size() ||
+                fn.compare(fn.size() - p3.size(), p3.size(), p3) != 0)
+              continue;
+            try {
+              int k = std::stoi(fn.substr(p1.size(), spos - p1.size()));
+              int s = std::stoi(fn.substr(spos + p2.size(),
+                                          fn.size() - p3.size() -
+                                              (spos + p2.size())));
+              auto it = run_top_step.find(k);
+              if (it == run_top_step.end() || s > it->second)
+                run_top_step[k] = s;
+            } catch (const std::exception &) {
+              continue;  // unparseable name -> skip
+            }
+          }
+        }
+
+        if (ckpt_resume_run >= 0) {
+          // Targeted resume: honor N regardless of completeness.
+          auto it = run_top_step.find(ckpt_resume_run);
+          if (it != run_top_step.end()) {
+            resume_run = ckpt_resume_run;
+            resume_top_step = it->second;
+          } else {
+            std::cerr << "[Resume] CP_CKPT_RESUME=" << ckpt_resume_run
+                      << " has no checkpoint; starting a new run." << std::endl;
+          }
+        } else if (!run_top_step.empty()) {
+          // Auto-resume: latest run, unless it is already complete.
+          auto last = std::prev(run_top_step.end());  // highest run key
+          if (last->second < max_steps - 1) {
+            resume_run = last->first;
+            resume_top_step = last->second;
+          } else {
+            std::cout << "[Resume] latest run " << last->first
+                      << " already complete at step " << last->second
+                      << "; starting a new run." << std::endl;
+          }
+        }
+      }
+
+      if (resume_run >= 0) {
+        run_number = resume_run;
+        ckpt_resuming = true;
+      } else {
+        run_number = next_free_log;
+      }
+
+      log_filename = "CP_Training_logs/CP_Training_log" +
+                     std::to_string(run_number) + ".csv";
+      const bool log_exists = std::filesystem::exists(log_filename);
+      std::cout << "Saving logs to: " << log_filename
+                << (ckpt_resuming ? " (resume run " : " (run ")
+                << run_number << ")\n";
 
       config_filename = "CP_Training_logs/CP_Training_log" +
-                        std::to_string(log_idx) + "_config.txt";
-      std::ofstream config_file(config_filename);
+                        std::to_string(run_number) + "_config.txt";
+      std::ofstream config_file(
+          config_filename,
+          (ckpt_resuming && log_exists) ? std::ios::app : std::ios::out);
+      if (ckpt_resuming && log_exists)
+        config_file << "\n# resumed run " << run_number << " from step "
+                    << resume_top_step << "\n";
       config_file << "Configuration:\n";
       config_file << "  Batch_size: " << B << "\n";
       config_file << "  context_length: " << config.context_length << "\n";
@@ -984,6 +1087,10 @@ int main(int argc, char **argv) {
       config_file << "  Min Learning Rate: " << min_lr << "\n";
       config_file << "  max_steps: " << max_steps << "\n";
       config_file << "  warmup_steps: " << warmup_steps << "\n";
+      config_file << "  checkpointing: " << (config.checkpointing ? 1 : 0) << "\n";
+      if (config.checkpointing)
+        config_file << "  ckpt_freq: " << CKPT_FREQ << "\n";
+      config_file << "  run: " << run_number << "\n";
 
       // Initial GPU memory
       size_t free_mem = 0, total_mem = 0;
@@ -996,17 +1103,30 @@ int main(int argc, char **argv) {
                   << " MB\n";
       config_file.close();
 
-      log_file.open(log_filename);
+      // Resume -> append to the same run's CSV; fresh run -> truncate + header.
+      const bool append_log = ckpt_resuming && log_exists;
+      log_file.open(log_filename, append_log ? std::ios::app : std::ios::out);
       if (!log_file.is_open()) {
         std::cerr << "ERROR: Could not open log file " << log_filename << "\n";
         std::exit(1);
       }
-      log_file << "step,loss,val_loss,lr,grad_norm,dt_ms,tok_per_sec,"
-                  "timer_data,timer_fwd,timer_loss,timer_bwd,timer_clip,"
-                  "timer_optim,timer_tok_emb,timer_pos_emb,timer_attn_cp,"
-                  "timer_mlp,timer_ln_f,timer_lm_head,mem_gpu_mb\n";
+      if (append_log) {
+        log_file << "# resumed run " << run_number << " from step "
+                 << resume_top_step << "\n";
+      } else {
+        log_file << "step,loss,val_loss,lr,grad_norm,dt_ms,tok_per_sec,"
+                    "timer_data,timer_fwd,timer_loss,timer_bwd,timer_clip,"
+                    "timer_optim,timer_tok_emb,timer_pos_emb,timer_attn_cp,"
+                    "timer_mlp,timer_ln_f,timer_lm_head,mem_gpu_mb\n";
+      }
       log_file << std::fixed << std::setprecision(6);
     }
+
+    // Broadcast the run number to all ranks so every CheckpointManager builds
+    // the identical prefix (gpt2_cp_run<run_number>).
+    int run_number_bc = (rank == 0) ? run_number : 0;
+    MPI_Bcast(&run_number_bc, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    run_number = run_number_bc;
 
     float val_loss_log = -1.0f;
 
@@ -1032,7 +1152,34 @@ int main(int argc, char **argv) {
       }
     }
 
-    for (int step = 0; step < max_steps; ++step) {
+    // ── Disk-state checkpoint manager + auto-resume ───────────────────────────
+    // shard_dir=false -> the save path is cp_checkpoints/<prefix>_step_<N>.ckpt
+    // (no rank in the name), so only rank 0 saves (CP replicas are identical
+    // after the per-step grad all-reduce, making rank-0 state authoritative).
+    // All ranks construct the manager and load_latest the shared file, so the
+    // resumed start_step is identical across ranks.
+    const std::string ckpt_prefix = "gpt2_cp_run" + std::to_string(run_number);
+    CheckpointManager ckpt_manager("cp_checkpoints", ckpt_prefix, 5, rank, false,
+                                   false);
+    int start_step = 0;
+    float latest_loss = 0.0f;
+    if (config.checkpointing && !mem_probe &&
+        ckpt_manager.load_latest(model, optimizer, start_step, latest_loss)) {
+      if (rank == 0)
+        std::cout << "[Resume] run " << run_number << " from step " << start_step
+                  << " (loss " << latest_loss << ")" << std::endl;
+      size_t batches_to_skip =
+          static_cast<size_t>(start_step) * grad_accum_steps;
+      if (batches_to_skip > 0) train_loader.skip_batches(batches_to_skip);
+      // Targeted resume of an already-complete run: the loop below is a no-op
+      // under the current max_steps. Make the reason explicit.
+      if (ckpt_resume_run >= 0 && start_step >= max_steps - 1 && rank == 0)
+        std::cerr << "[Resume] run " << run_number << " already complete at step "
+                  << start_step << " (max_steps=" << max_steps
+                  << "). Raise CP_MAX_STEPS to train further." << std::endl;
+    }
+
+    for (int step = start_step; step < max_steps; ++step) {
       try {
         timer_step.start_timer();
 
@@ -1072,6 +1219,19 @@ int main(int argc, char **argv) {
                       << std::setprecision(4) << val_loss_accum << "\n";
           }
           val_loss_log = val_loss_accum;
+        }
+
+        // ---- Checkpoint save (rank 0 only) ---- runs on its own CKPT_FREQ
+        // cadence, independent of VAL_FREQ (val_loss_log carries the most
+        // recent validation loss, possibly stale between val steps).
+        if (config.checkpointing && rank == 0 &&
+            (step % CKPT_FREQ == 0 || step == max_steps - 1)) {
+          try {
+            ckpt_manager.save(step, model, optimizer, val_loss_log);
+          } catch (const std::exception &e) {
+            std::cerr << "[WARN] checkpoint save at step " << step
+                      << " failed: " << e.what() << std::endl;
+          }
         }
 
         // ---- Token generation every TOK_GEN_FREQ steps ---- (skip in probe)

@@ -74,7 +74,9 @@ MPI_LIBDIR := $(shell $(CXX) --showme:libdirs 2>/dev/null | tr ' ' '\n' | head -
 # =============================================================================
 INCLUDES := -I$(CP_ROOT) -I$(SCRIPTS_DIR) -I$(TENSOR_INC) -I$(PROFILER_INC) -I$(CUDA_INC) -DWITH_CUDA
 
-CXXFLAGS  := -std=c++17 -fPIC -O3 -g $(INCLUDES)
+# c++2a (C++20) matches BluTrain/Makefile; checkpointing/Checkpointing.h uses
+# C++20 std::string::starts_with/ends_with.
+CXXFLAGS  := -std=c++2a -fPIC -O3 -g $(INCLUDES)
 NVCCFLAGS := -std=c++17 -Xcompiler="-fPIC" -arch=sm_$(SM_ARCH) -O3 -g \
              --use_fast_math --expt-relaxed-constexpr -ccbin=$(CXX) $(INCLUDES)
 
