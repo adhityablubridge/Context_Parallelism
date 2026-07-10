@@ -8,6 +8,11 @@ The training entrypoint is [Scripts/BluTrain/gpt2_cp_test.cpp](Scripts/BluTrain/
 It runs one process per GPU under MPI; each rank holds a sequence shard and the
 ring rotator exchanges K/V (and dK/dV in the backward pass) across ranks.
 
+There is also a **Llama-style** context-parallel trainer,
+[Scripts/BluTrain/bluscriptCP.cpp](Scripts/BluTrain/bluscriptCP.cpp) (fused QK-norm + RoPE + GQA,
+SwiGLU, RMSNorm), supporting both **Ring** and **Ulysses** attention and composing CP with
+DataParallel — see [Context-parallel Llama training (bluscriptCP)](#context-parallel-llama-training-bluscriptcp).
+
 ## Repository layout
 
 | Path | Contents |
@@ -15,7 +20,7 @@ ring rotator exchanges K/V (and dK/dV in the backward pass) across ranks.
 | `context_parallel/` | Ring-attention forward/backward, fused SDPA kernels, KV-pack, rotators |
 | `process_group/` | `ProcessGroupNCCL` (NCCL collectives + async ring stream), `DeviceMesh` |
 | `Data_Loader/` | mmap shard `DataLoader`, plus `Data/` token shards |
-| `Scripts/BluTrain/` | `gpt2_cp_test.cpp` — the training binary source |
+| `Scripts/BluTrain/` | `gpt2_cp_test.cpp` (GPT-2 CP trainer) + `bluscriptCP.cpp` (Llama-style CP trainer: Ring/Ulysses, fused RoPE+QK-norm+GQA) |
 | `Scripts/Pytorch/` | `gpt2_cp_attnstyle_fp32.py` — PyTorch parity reference |
 | `Tensor-Implementations/` | `OwnTensor` tensor library (git submodule → `libtensor`) |
 
@@ -145,12 +150,120 @@ a direct `mpirun` invocation as above.)
 make [all]                 Build the CP training binary (build/gpt2_cp_test_exec)
 make libtensor             Build libtensor in the Tensor-Implementations submodule
 make run [NP=2] [ARGS=...] mpirun the training binary on NP ranks
+make CP_FUSED_ROPE=1 bluscript-cp        Build the Llama CP trainer (build/bluscriptCP_exec)
+make CP_FUSED_ROPE=1 run-bluscript-cp [NP=2]  mpirun bluscriptCP on NP ranks (ring; drop the flag + CP_ATTN_MODE=ulysses for Ulysses)
 make run-snippet FILE=<f>  Compile + run a single .cpp against libtensor
 make run-folder  FOLDER=<d> Compile + run every .cpp in a folder
 make rebuild               clean + all
 make clean                 Remove CP build artifacts (not libtensor)
 make print_sm              Print the detected GPU compute capability
 make help                  List all targets and flags
+```
+
+## Context-parallel Llama training (bluscriptCP)
+
+[Scripts/BluTrain/bluscriptCP.cpp](Scripts/BluTrain/bluscriptCP.cpp) is a second, **Llama-style**
+trainer (distinct from `gpt2_cp_test`): fp32 model with bf16 **fused QK-norm + RoPE + grouped-query
+attention**, SwiGLU MLP, RMSNorm, tied lm_head. RoPE / QK-norm / GQA run **inside** the
+context-parallel layer (fused in the CP kernels), and it composes **CP with DataParallel** on the
+unified `ProcessGroupNCCL`.
+
+Two attention modes, selected by `CP_ATTN_MODE`:
+
+- **`ring`** (default) — RingAttention via the fused-RoPE CP kernels (GQA + HeadTail load-balance).
+  **Requires building with `CP_FUSED_ROPE=1`.**
+- **`ulysses`** — DeepSpeed-style all-to-all sequence parallelism (GQA, contiguous shard). Works in
+  the default build.
+
+**Topology.** `CP_SIZE` (default = world size) sets the context-parallel group size;
+`dp_size = world_size / CP_SIZE`. So `CP_SIZE = world_size` is pure CP (sequence split across all
+ranks); a proper divisor gives 2-D **DP×CP** (data-parallel replicas each running a CP group). The
+sequence is split across the CP group; DataParallel replicates params and reduces gradients across
+all ranks. `world_size % CP_SIZE` must be 0.
+
+### Build + run
+
+```bash
+# --- Ring (default). Pass CP_FUSED_ROPE=1 to BOTH build and run. ---
+make CP_FUSED_ROPE=1 bluscript-cp
+CP_DATA_ROOT=/path/to/shards \
+    make CP_FUSED_ROPE=1 run-bluscript-cp NP=2
+
+# --- Ulysses (default build). ---
+make bluscript-cp
+CP_ATTN_MODE=ulysses CP_DATA_ROOT=/path/to/shards \
+    make run-bluscript-cp NP=2
+```
+
+`NP` = ranks/GPUs. **Env vars set before `make ... run-bluscript-cp` ARE forwarded to the ranks**
+(OpenMPI forwards the launcher's environment); the run target sets `LD_LIBRARY_PATH` for you.
+
+> **`CP_FUSED_ROPE` must be passed to BOTH the build and the run target for ring mode.** Ring and
+> Ulysses share objects via this build flag (tracked by a flag-stamp, so no `make clean` is needed
+> when you flip it). A bare `make run-bluscript-cp` re-evaluates with the flag off and rebuilds to
+> the default (Ulysses-only) kernel — which then throws in ring mode.
+
+> **Checkpoints auto-resume** from `checkpoints_bluscriptcp/`. For a fresh smoke run,
+> `rm -rf checkpoints_bluscriptcp` or bump `CP_MAX_STEPS` (a completed run at the same step count
+> short-circuits a rerun).
+
+### Environment variables (bluscriptCP)
+
+**Topology / attention**
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `CP_SIZE` | world size | CP group size. `= world_size` ⇒ CP-only; divisor ⇒ 2-D DP×CP. |
+| `CP_ATTN_MODE` | `ring` | `ring` (fused-RoPE ring; needs `CP_FUSED_ROPE=1` build) or `ulysses` (all-to-all). |
+| `CP_ROTATOR` | `alltoall` | Ring comm strategy: `p2p` / `alltoall` / `allgather`. |
+
+**Model / data / optimization**
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `CP_N_EMBD` | 768 | `d_model`. |
+| `CP_N_LAYER` | 12 | Transformer blocks. |
+| `CP_N_HEAD` | 12 | Query heads. |
+| `CP_N_KVHEAD` | 4 | KV heads (GQA). `q_heads % kv_heads == 0`; `head_dim = d_model/q_heads` must be **64 or 128**. |
+| `CP_T` | 4096 | Sequence length (`== context_length`). Must be even; ring needs `T % (2·CP_SIZE) == 0`, ulysses `T % CP_SIZE == 0`. |
+| `CP_B` | 8 | Micro-batch per rank. |
+| `CP_GLOBAL_BATCH` | 524288 | Tokens/step. Must be divisible by `B·T·dp_size`; `grad_accum = CP_GLOBAL_BATCH / (B·T·dp_size)`. |
+| `CP_MAX_STEPS` | 19073 | Training steps. |
+| `CP_WARMUP` | 715 | LR warmup steps. |
+| `CP_DATA_ROOT` | (hardcoded path) | Token-shard directory (train/val `*.bin`, uint16). |
+
+**RoPE / YaRN context extension** (the shared `build_rope_cache`; `YARN_SCALE=1.0` ⇒ plain RoPE)
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `YARN_SCALE` | 1.0 | Context-extension factor; set to `target_ctx / orig_ctx`. |
+| `YARN_ORIG_MAXPOS` | 1024 | Original pretrain context length. |
+| `YARN_BETA_FAST` / `YARN_BETA_SLOW` | 32 / 1 | NTK-by-parts correction bounds. |
+
+**Diagnostics (ring) + device mapping**
+
+| Var | Effect |
+|-----|--------|
+| `CP_NO_OVERLAP=1` | Serialize fwd+bwd ring comm (A/B for overlap races). |
+| `CP_NO_OVERLAP_FWD=1` / `CP_NO_OVERLAP_BWD=1` | Serialize only the forward / backward ring. |
+| `CP_RING_BLOCKING=1` | Make the dedicated ring stream blocking. |
+| `CP_SYNC_RING=1` | Host-sync after each ring exchange. |
+| `NO_GPUS_PER_NODE=<n>` | Override GPUs-per-node for device mapping (e.g. oversubscribing ranks). |
+
+**Build flags** (compile-time; pass to `make`, not the runtime env)
+
+| Flag | Effect |
+|------|--------|
+| `CP_FUSED_ROPE=1` | Compile the fused-RoPE CP kernels. **REQUIRED for `CP_ATTN_MODE=ring`.** |
+| `CP_ROPE_DEBUG=1` | Add the out-of-range RoPE-index counter (bring-up only; adds a per-call sync). |
+
+### Example — full-scale (114M), 2 GPUs, CP-only ring
+
+```bash
+make CP_FUSED_ROPE=1 bluscript-cp
+CP_DATA_ROOT=/path/to/shards CP_SIZE=2 CP_T=4096 CP_B=1 CP_GLOBAL_BATCH=4096 \
+    make CP_FUSED_ROPE=1 run-bluscript-cp NP=2
+# d_model 768 / 12 layers / q12-kv4 (hd 64) / T 4096, sequence split 2048/rank.
 ```
 
 ## PyTorch parity reference
