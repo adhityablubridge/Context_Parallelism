@@ -25,7 +25,7 @@
 #include "core/Tensor.h"
 #include "dtype/Types.h"
 #include "ops/helpers/AttentionKernels.h"
-#include "process_group/ProcessGroupNCCL.h"
+#include "ProcessGroupNCCL.h"   // canonical BluTrain PG (via -IBluTrain/dist/communication/include)
 
 #include "context_parallel/UlyssesAttention.h"
 

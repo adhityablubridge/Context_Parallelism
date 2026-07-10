@@ -122,82 +122,57 @@ int DeviceMesh::get_dim_rank(int64_t mesh_dim) const {
 
 void DeviceMesh::initialize_process_groups() {
     process_groups_.resize(ndim());
-    mpi_comms_.resize(ndim(), MPI_COMM_NULL);
-    
+
+    // CUDA device MUST be set before any comm/stream creation.
+    int gpus_per_node = 1;
+    cudaGetDeviceCount(&gpus_per_node);
+    if (const char* env = std::getenv("NO_GPUS_PER_NODE")) {
+        int parsed = std::atoi(env); if (parsed > 0) gpus_per_node = parsed;
+    }
+    int local_rank = global_rank_ % gpus_per_node;
+    cudaSetDevice(local_rank);
+
+    // 1) Build the WORLD process group (one MPI_Bcast of the ncclUniqueId inside
+    //    init_process_group). Its comm_ is the ncclCommSplit parent for all axes.
+    world_pg_ = init_process_group(total_devices_, global_rank_);
+    ncclComm_t world_comm = world_pg_->get_comm();
+
+    // 2) Per axis: ncclCommSplit(world_comm, color=other-coords, key=axis-coord).
+    //    This is COLLECTIVE over world_comm (all ranks call it each iteration).
+    //    Replaces MPI_Comm_split + per-axis MPI id-bcast, and is correct for N-D.
     for (int64_t mesh_dim = 0; mesh_dim < ndim(); ++mesh_dim) {
-  
+        // Re-assert the GLOBAL physical device each iteration: the previous axis's
+        // PG ctor may have left a different device current, which would otherwise
+        // create this axis's comm_stream on the wrong device (stream/comm device
+        // mismatch -> NCCL "invalid resource handle").
+        cudaSetDevice(local_rank);
         std::vector<int> group_ranks = get_group_ranks(mesh_dim);
         int64_t group_size = group_ranks.size();
- 
         auto it = std::find(group_ranks.begin(), group_ranks.end(), global_rank_);
         int64_t my_group_rank = std::distance(group_ranks.begin(), it);
-        
-        int64_t color = 0;
-        int64_t multiplier = 1;
+
+        int color = 0, multiplier = 1;
         for (int64_t d = ndim() - 1; d >= 0; --d) {
-            if (d != mesh_dim) { 
-                color += my_coordinate_[d] * multiplier;
-                multiplier *= mesh_shape_[d];
-            }
+            if (d != mesh_dim) { color += (int)my_coordinate_[d] * multiplier; multiplier *= mesh_shape_[d]; }
+        }
+        int key = (int)my_coordinate_[mesh_dim];
+
+        ncclComm_t sub_comm = nullptr;
+        ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+        ncclResult_t sr = ncclCommSplit(world_comm, color, key, &sub_comm, &config);
+        if (sr != ncclSuccess || sub_comm == nullptr) {
+            throw std::runtime_error("DeviceMesh: ncclCommSplit failed for mesh_dim " +
+                                     std::to_string(mesh_dim));
         }
 
-        int64_t key = my_coordinate_[mesh_dim];
-
-       
-        int64_t mpi_err = MPI_Comm_split(MPI_COMM_WORLD, color, key, &mpi_comms_[mesh_dim]);
-        if (mpi_err != MPI_SUCCESS) {
-            throw std::runtime_error("DeviceMesh: MPI_Comm_split failed for mesh_dim " + 
-                                   std::to_string(mesh_dim));
-        }
-        
-      
-        int sub_comm_size;
-        MPI_Comm_size(mpi_comms_[mesh_dim], &sub_comm_size);
-        if (sub_comm_size != group_size) {
-            std::cerr << "[Rank " << global_rank_ << "] ERROR: mesh_dim=" << mesh_dim
-                      << " sub_comm_size=" << sub_comm_size 
-                      << " expected=" << group_size << "\n";
-            throw std::runtime_error("DeviceMesh: MPI sub-communicator size mismatch");
-        }
-        
-        int sub_comm_rank;
-        MPI_Comm_rank(mpi_comms_[mesh_dim], &sub_comm_rank);
-        if (sub_comm_rank != my_group_rank) {
-            std::cerr << "[Rank " << global_rank_ << "] ERROR: mesh_dim=" << mesh_dim
-                      << " sub_comm_rank=" << sub_comm_rank 
-                      << " expected=" << my_group_rank << "\n";
-            throw std::runtime_error("DeviceMesh: MPI sub-communicator rank mismatch");
-        }
-          
-        // ncclUniqueId nccl_id = create_nccl_id(0, mpi_comms_[mesh_dim]);
-
-        int64_t device = device_ids_[global_rank_];
-
-        // CRITICAL: Set CUDA device BEFORE creating any CUDA resources (streams, events)
-        // CUDA streams and events are device-specific and must be created on the correct device
-        // Auto-detect GPUs per node, can be overridden by NO_GPUS_PER_NODE env var
-        int gpus_per_node = 1;
-        cudaGetDeviceCount(&gpus_per_node);
-        const char* env = std::getenv("NO_GPUS_PER_NODE");
-        if (env) {
-            int parsed = std::atoi(env);
-            if (parsed > 0) gpus_per_node = parsed;
-        }
-        int local_rank = global_rank_ % gpus_per_node;
-        cudaSetDevice(local_rank);
-
-        std::shared_ptr<Work> work_obj;
+        // Dedicated BLOCKING comm stream per axis PG (ring overlap uses a separate
+        // non-blocking cpRingStream() with explicit event ordering).
         cudaStream_t comm_stream;
-        // Shared comm stream stays BLOCKING (original behavior) so DP/TP
-        // collectives keep their implicit FIFO ordering — this is the known-good,
-        // stable path. Compute/comm overlap is achieved ONLY for the CP K/V ring,
-        // via a SEPARATE dedicated non-blocking stream (pg->cpRingStream()), with
-        // explicit CUDA-event ordering. This scopes the non-blocking behavior to
-        // the ring and never destabilizes other collectives.
         cudaStreamCreate(&comm_stream);
-
-        process_groups_[mesh_dim] = init_process_group(group_size, my_group_rank, comm_stream);
-    
+        auto work_obj = std::make_shared<Work>(comm_stream, sub_comm);
+        process_groups_[mesh_dim] = std::make_shared<ProcessGroupNCCL>(
+            (int)group_size, (int)my_group_rank, sub_comm, work_obj, comm_stream);
+        process_groups_[mesh_dim]->set_owns_stream(true);
     }
 }
 

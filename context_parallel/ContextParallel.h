@@ -6,7 +6,7 @@
 #include "core/Tensor.h"
 // #include "dnn/DistributedNN.h"
 #include "ops/IndexingOps.h"
-#include "process_group/ProcessGroupNCCL.h"
+#include "ProcessGroupNCCL.h"   // canonical BluTrain PG (via -IBluTrain/dist/communication/include)
 #include "process_group/device_mesh.h"
 #include "context_parallel/LoadBalancer.h"
 

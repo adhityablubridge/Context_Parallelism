@@ -30,7 +30,7 @@
 // ---------------------------------------------------------------------------
 
 #include "core/Tensor.h"
-#include "process_group/ProcessGroupNCCL.h"
+#include "ProcessGroupNCCL.h"   // canonical BluTrain PG (via -IBluTrain/dist/communication/include)
 
 #include <cuda_runtime.h>
 #include <stdexcept>

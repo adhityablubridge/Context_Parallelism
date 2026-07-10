@@ -4,7 +4,7 @@
 #include "autograd/Node.h"
 #include "autograd/ops_template.h"
 #include "core/Tensor.h"
-#include "process_group/ProcessGroupNCCL.h"
+#include "ProcessGroupNCCL.h"   // canonical BluTrain PG (via -IBluTrain/dist/communication/include)
 // #include "tensor/dtensor.h"
 #include "context_parallel/LoadBalancer.h"
 

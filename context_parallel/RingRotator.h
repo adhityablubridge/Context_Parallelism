@@ -1,6 +1,6 @@
 #pragma once
 
-#include "process_group/ProcessGroupNCCL.h"
+#include "ProcessGroupNCCL.h"   // canonical BluTrain PG (via -IBluTrain/dist/communication/include)
 #include "core/Tensor.h"
 #include "device/CachingCudaAllocator.h"
 #include <vector>

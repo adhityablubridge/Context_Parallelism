@@ -33,7 +33,7 @@ public:
 #include "mlp/activation.h"
 #include "nn/NN.h"
 #include "nn/optimizer/Optim.h"
-#include "process_group/ProcessGroupNCCL.h"
+#include "ProcessGroupNCCL.h"   // canonical BluTrain PG (via -IBluTrain/dist/communication/include)
 #include "process_group/device_mesh.h"
 #include "profiler/AllocationTracker.h"
 // DataLoader (same path as gpt2_tp_test)

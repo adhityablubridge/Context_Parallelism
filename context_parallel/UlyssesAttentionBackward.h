@@ -26,7 +26,7 @@
 
 #include "autograd/Node.h"
 #include "core/Tensor.h"
-#include "process_group/ProcessGroupNCCL.h"
+#include "ProcessGroupNCCL.h"   // canonical BluTrain PG (via -IBluTrain/dist/communication/include)
 
 #include "context_parallel/FusedSDPAOp.h"
 #include "context_parallel/UlyssesAttention.h"

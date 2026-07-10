@@ -72,7 +72,11 @@ MPI_LIBDIR := $(shell $(CXX) --showme:libdirs 2>/dev/null | tr ' ' '\n' | head -
 # =============================================================================
 # Compiler / Linker Flags
 # =============================================================================
-INCLUDES := -I$(CP_ROOT) -I$(SCRIPTS_DIR) -I$(TENSOR_INC) -I$(PROFILER_INC) -I$(CUDA_INC) -DWITH_CUDA
+# -IBLUTRAIN_COMM_INC brings in the canonical (unified) ProcessGroupNCCL.h + CpuSync.hpp
+# (BluTrain dist/communication) used by both DataParallel and ContextParallel.
+BLUTRAIN_COMM_INC := BluTrain/dist/communication/include
+BLUTRAIN_DP_INC   := BluTrain/dist/Data-Parallel/include
+INCLUDES := -I$(CP_ROOT) -I$(SCRIPTS_DIR) -I$(TENSOR_INC) -I$(PROFILER_INC) -I$(CUDA_INC) -I$(BLUTRAIN_COMM_INC) -I$(BLUTRAIN_DP_INC) -DWITH_CUDA
 
 # CP fused-RoPE kernels (context_parallel/GQA_fused_{fwd,bwd}_sm103_cp.cu) + the
 # FusedRoPESDPA.h wrappers compile only under -DCP_FUSED_ROPE; the default build
@@ -145,12 +149,22 @@ CU_EXCLUDE := \
     $(CP_DIR)/AttentionBackward_sm89.cu
 
 CPP_EXCLUDE := \
-    $(PG_DIR)/test.cpp
+    $(PG_DIR)/test.cpp \
+    $(PG_DIR)/processGroupNCCL.cpp
+# ^ CP's forked PG impl is superseded by the BluTrain canonical PG (below); the
+#   header process_group/ProcessGroupNCCL.h + CpuSync_fixed.hpp stay on disk but
+#   are no longer included anywhere, so nothing pulls them in.
+
+# Canonical PG implementation (unified for CP + DP), compiled into the CP targets.
+# processGroupNccl.cpp depends on the dist Error/registry infra (Error_logs.cpp).
+BLUTRAIN_PG_SRC := BluTrain/dist/communication/src/processGroupNccl.cpp \
+                   BluTrain/dist/Data-Parallel/src/Error_logs.cpp
 
 CU_SOURCES := $(filter-out $(CU_EXCLUDE), \
                 $(shell find $(CP_DIR) $(PG_DIR) -name '*.cu' 2>/dev/null))
 CPP_SOURCES := $(filter-out $(CPP_EXCLUDE), \
-                $(shell find $(CP_DIR) $(PG_DIR) -name '*.cpp' 2>/dev/null))
+                $(shell find $(CP_DIR) $(PG_DIR) -name '*.cpp' 2>/dev/null)) \
+                $(BLUTRAIN_PG_SRC)
 
 OBJECTS_FROM_CU  := $(patsubst %.cu,$(OBJDIR)/%.o,$(CU_SOURCES))
 OBJECTS_FROM_CPP := $(patsubst %.cpp,$(OBJDIR)/%.o,$(CPP_SOURCES))
@@ -275,6 +289,31 @@ run-cp-rope-fused: $(FUSED_EXE)
 	@echo "--- Running fused RoPE parity (single GPU) ---"
 	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
 	    ./$(FUSED_EXE) $(ARGS)
+
+# ---- bluscriptCP: context-parallel Llama training (DataParallel + ContextParallel
+#      on the unified PG). Ring path needs CP_FUSED_ROPE=1.
+# Build: make CP_FUSED_ROPE=1 bluscript-cp    Run: make CP_FUSED_ROPE=1 run-bluscript-cp NP=2
+BLUSCRIPT_SRC := Scripts/BluTrain/bluscriptCP.cpp
+BLUSCRIPT_OBJ := $(OBJDIR)/Scripts/BluTrain/bluscriptCP.o
+BLUSCRIPT_EXE := $(BINDIR)/bluscriptCP_exec
+# DataParallel + its profiler dep — scoped to this target only (parity tests don't need them).
+BLUSCRIPT_DIST_SRCS := BluTrain/dist/Data-Parallel/src/DataParallel.cpp \
+                       BluTrain/dist/Data-Parallel/src/profiler.cpp
+BLUSCRIPT_DIST_OBJ  := $(patsubst %.cpp,$(OBJDIR)/%.o,$(BLUSCRIPT_DIST_SRCS))
+.PHONY: bluscript-cp run-bluscript-cp
+bluscript-cp: $(BLUSCRIPT_EXE)
+$(BLUSCRIPT_EXE): $(BLUSCRIPT_OBJ) $(BLUSCRIPT_DIST_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) | $(TENSOR_LIB_A) $(PROFILER_LIB)
+	@mkdir -p $(BINDIR)
+	@echo -e "\n--- Linking bluscriptCP (sm_$(SM_ARCH)): $@"
+	$(NVCC) $(LINKFLAGS) $(LDFLAGS) -o $@ \
+	        $(BLUSCRIPT_OBJ) $(BLUSCRIPT_DIST_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) \
+	        -Xlinker --start-group $(TENSOR_LIB_A) -Xlinker --end-group \
+	        $(LDLIBS) $(LINK_MEMFLAGS)
+
+run-bluscript-cp: $(BLUSCRIPT_EXE)
+	@echo "--- Running bluscriptCP on $(NP) rank(s) ---"
+	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
+	    mpirun -np $(NP) ./$(BLUSCRIPT_EXE) $(ARGS)
 
 # =============================================================================
 # Ulysses (DeepSpeed-style) CP attention parity test (additive; new target).
