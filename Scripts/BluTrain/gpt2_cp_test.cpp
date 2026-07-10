@@ -743,13 +743,13 @@ int main(int argc, char **argv) {
     const float min_lr = max_lr * 0.1f;
     const int VAL_FREQ = 100;
     const int TOK_GEN_FREQ = 100;
-    // Checkpoint save cadence (steps). Default matches gpt2_fmha_ddp.cpp.
-    int CKPT_FREQ = 5000;
-    if (const char *e = std::getenv("CP_CKPT_FREQ")) CKPT_FREQ = atoi(e);
 
     // int max_steps    = (static_cast<int>(num_params) / global_batch ) * 5;
     int max_steps = fourtyfour?6768:1555;
     int warmup_steps = max_steps / 10;
+    // Checkpoint save cadence (steps). Default matches gpt2_fmha_ddp.cpp.
+    int CKPT_FREQ = max_steps/20;
+    if (const char *e = std::getenv("CP_CKPT_FREQ")) CKPT_FREQ = atoi(e);
     // Test-only overrides for fast overlap-bisection runs (default = original).
     if (const char *e = std::getenv("CP_MAX_STEPS")) max_steps = atoi(e);
     if (const char *e = std::getenv("CP_WARMUP"))    warmup_steps = atoi(e);
@@ -931,8 +931,8 @@ int main(int argc, char **argv) {
         std::cout << "Loaded NAMED init weights (" << recs.size()
                   << " records)\n";
     }
+    
     // ----- END NAME-AWARE INIT WEIGHT LOAD -----
-
 
     if (rank == 0) {
       std::cout << "Parameters: " << num_params << "\n";
