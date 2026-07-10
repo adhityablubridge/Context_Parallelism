@@ -25,6 +25,7 @@
 
 #include "core/Tensor.h"
 #include "context_parallel/SDPAOp.h"   // SDPAResult{out, lse}
+#include "dtype/Types.h"               // bfloat16_t
 
 #include <cstdint>
 #include <stdexcept>
@@ -37,47 +38,35 @@ namespace OwnTensor {
 namespace cp {
 namespace cuda {
 
-// ---- FROZEN CONTRACT (Phase 0) — implemented by the kernel team -------------
-// Fused forward: QK-norm(gamma) + RoPE(4-delta global positions) + GQA + causal
-// attention. fp32 in/out; internal precision is the kernel's choice (must
-// reduce to today's single-GPU output when q_d0==q_d1, k_d0==k_d1, offsets 0).
-// Last dim of every tensor has stride 1.
+// ---- CONTRACT (Phase 3) — implemented in GQA_fused_{fwd,bwd}_sm103_cp.cu -----
+// Fused forward: QK-norm(gamma) + RoPE(4-delta global positions) + GQA + causal.
+// bf16 Q/K/V (separate, contiguous [B,H,T,D]); bf16 output; fp32 lse. Internal
+// math is bf16 WMMA (matches the production GQA kernel). Reduces to the non-CP
+// kernel's output when q_d0==q_d1, k_d0==k_d1, and all deltas are 0. The four
+// deltas index RoPE ONLY; causal masking uses local indices (the CP driver
+// guarantees locally-monotonic sub-chunks). `interleaved` false => NeoX pairing
+// (matches build_rope_cache). See RopeDeltas.h for the delta semantics.
 void gqa_fused_rope_cp_forward(
-    const float* query, int64_t q_sB, int64_t q_sM, int64_t q_sH,
-    const float* key,   int64_t k_sB, int64_t k_sM, int64_t k_sH,
-    const float* value, int64_t v_sB, int64_t v_sM, int64_t v_sH,
-    float* output,      int64_t o_sB, int64_t o_sM, int64_t o_sH,
-    float* lse,         int64_t lse_sB, int64_t lse_sH,         // [B,Nq,T_q] (keepdim [.,.,.,1])
-    const float* cos_sin_cache,                                // [cache_len, hd]
-    const float* q_gamma, const float* k_gamma,                // [hd] each (nullptr => skip QK-norm)
-    int64_t B, int64_t Nq_heads, int64_t Nkv_heads,
-    int64_t T_q, int64_t T_k,
+    const bfloat16_t* Q, const bfloat16_t* K, const bfloat16_t* V,
+    const float* cos_sin_cache, const float* q_gamma, const float* k_gamma,  // [hd]/nullptr
+    bfloat16_t* output, float* lse,                            // lse [B,Nq,T_q] contiguous
+    int B, int Nq_heads, int Nkv_heads, int T_q, int T_k, int hd, int cache_seq_len,
     int q_d0, int q_d1, int k_d0, int k_d1,                     // per-side head/tail deltas
-    int64_t hd, int cache_len,
-    bool is_causal, float scale, float eps);
+    float eps, bool interleaved, bool is_causal, float scale);
 
-// Fused backward: recomputes RoPE/QK-norm with the SAME deltas. Caller supplies
-// the LSE to use (merged or per-step). Returns dQ/dK/dV and the PER-CALL partial
-// gamma grads dq_gamma/dk_gamma (caller accumulates locally + rides the existing
-// param-grad all-reduce — see RopeGammaAccum.h). D_buf is caller scratch [B*Nq,T_q].
+// Fused backward: recomputes RoPE/QK-norm (and rstd) with the SAME deltas. lse
+// is the caller-chosen LSE (merged or per-step). Returns dQ/dK/dV (bf16) and the
+// PER-CALL partial gamma grads dq_gamma/dk_gamma (fp32; caller accumulates
+// locally + rides the param-grad all-reduce — see RopeGammaAccum.h).
 void gqa_fused_rope_cp_backward(
-    const float* query, int64_t q_sB, int64_t q_sM, int64_t q_sH,
-    const float* key,   int64_t k_sB, int64_t k_sM, int64_t k_sH,
-    const float* value, int64_t v_sB, int64_t v_sM, int64_t v_sH,
-    const float* output,      int64_t o_sB, int64_t o_sM, int64_t o_sH,
-    const float* grad_output, int64_t do_sB, int64_t do_sM, int64_t do_sH,
-    const float* lse,         int64_t lse_sB, int64_t lse_sH,
+    const bfloat16_t* Q, const bfloat16_t* K, const bfloat16_t* V,
     const float* cos_sin_cache, const float* q_gamma, const float* k_gamma,
-    float* grad_query, int64_t dq_sB, int64_t dq_sM, int64_t dq_sH,
-    float* grad_key,   int64_t dk_sB, int64_t dk_sM, int64_t dk_sH,
-    float* grad_value, int64_t dv_sB, int64_t dv_sM, int64_t dv_sH,
+    const bfloat16_t* output, const bfloat16_t* grad_output, const float* lse,
+    bfloat16_t* grad_Q, bfloat16_t* grad_K, bfloat16_t* grad_V,
     float* dq_gamma, float* dk_gamma,                          // [hd] each, per-call partials
-    float* D_buf,
-    int64_t B, int64_t Nq_heads, int64_t Nkv_heads,
-    int64_t T_q, int64_t T_k,
+    int B, int Nq_heads, int Nkv_heads, int T_q, int T_k, int hd, int cache_seq_len,
     int q_d0, int q_d1, int k_d0, int k_d1,
-    int64_t hd, int cache_len,
-    bool is_causal, float scale, float eps);
+    float eps, bool interleaved, bool is_causal, float scale);
 
 } // namespace cuda
 } // namespace cp
@@ -113,28 +102,28 @@ inline SDPAResult sdpa_fused_forward_rope(
   const int64_t Nkv = k.shape().dims[1];
   const int64_t T_k = k.shape().dims[2];
 
-  TensorOptions base = q.opts().with_req_grad(false);
-  Tensor out = Tensor::empty(Shape({{B, Nq, T_q, D}}), base);
-  Tensor lse = Tensor::empty(Shape({{B, Nq, T_q, 1}}), base);  // keepdim (SDPAMerger)
+  // Cast to contiguous bf16 for the WMMA kernel; lse stays fp32.
+  Tensor qb = q.contiguous().as_type(Dtype::Bfloat16);
+  Tensor kb = k.contiguous().as_type(Dtype::Bfloat16);
+  Tensor vb = v.contiguous().as_type(Dtype::Bfloat16);
+  TensorOptions bf = q.opts().with_dtype(Dtype::Bfloat16).with_req_grad(false);
+  TensorOptions fp = q.opts().with_dtype(Dtype::Float32).with_req_grad(false);
+  Tensor out_bf = Tensor::empty(Shape({{B, Nq, T_q, D}}), bf);
+  Tensor lse    = Tensor::empty(Shape({{B, Nq, T_q, 1}}), fp);  // keepdim (SDPAMerger)
 
-  const auto& qs = q.stride().strides; const auto& ks = k.stride().strides;
-  const auto& vs = v.stride().strides;
-  const int64_t o_sB = Nq * T_q * D, o_sH = T_q * D, o_sM = D;
-  const int64_t lse_sB = Nq * T_q, lse_sH = T_q;
   const int   cache_len = static_cast<int>(cos_sin_cache.shape().dims[0]);
   const float* qg = q_gamma.is_valid() ? q_gamma.data<float>() : nullptr;
   const float* kg = k_gamma.is_valid() ? k_gamma.data<float>() : nullptr;
 
   OwnTensor::cp::cuda::gqa_fused_rope_cp_forward(
-      q.data<float>(), qs[0], qs[2], qs[1],
-      k.data<float>(), ks[0], ks[2], ks[1],
-      v.data<float>(), vs[0], vs[2], vs[1],
-      out.data<float>(), o_sB, o_sM, o_sH,
-      lse.data<float>(), lse_sB, lse_sH,
+      qb.data<bfloat16_t>(), kb.data<bfloat16_t>(), vb.data<bfloat16_t>(),
       cos_sin_cache.data<float>(), qg, kg,
-      B, Nq, Nkv, T_q, T_k,
+      out_bf.data<bfloat16_t>(), lse.data<float>(),
+      static_cast<int>(B), static_cast<int>(Nq), static_cast<int>(Nkv),
+      static_cast<int>(T_q), static_cast<int>(T_k), static_cast<int>(D), cache_len,
       q_d0, q_d1, k_d0, k_d1,
-      D, cache_len, is_causal, scale, eps);
+      eps, /*interleaved=*/false, is_causal, scale);
+  Tensor out = out_bf.as_type(Dtype::Float32);
   return SDPAResult{out, lse};
 #else
   (void)q; (void)k; (void)v; (void)is_causal; (void)scale;
@@ -164,41 +153,37 @@ inline SDPARoPEBackwardResult sdpa_fused_backward_rope(
   const int64_t Nkv = k.shape().dims[1];
   const int64_t T_k = k.shape().dims[2];
 
-  TensorOptions base = q.opts().with_req_grad(false);
-  Tensor dQ = Tensor::empty(q.shape(), base);
-  Tensor dK = Tensor::empty(k.shape(), base);
-  Tensor dV = Tensor::empty(v.shape(), base);
-  Tensor dq_gamma = Tensor::zeros(Shape({{D}}), base);
-  Tensor dk_gamma = Tensor::zeros(Shape({{D}}), base);
-  Tensor D_buf = Tensor::empty(Shape({{B * Nq, T_q}}), base);
+  // Cast inputs to contiguous bf16 for the WMMA kernel.
+  Tensor qb  = q.contiguous().as_type(Dtype::Bfloat16);
+  Tensor kb  = k.contiguous().as_type(Dtype::Bfloat16);
+  Tensor vb  = v.contiguous().as_type(Dtype::Bfloat16);
+  Tensor ob  = out.contiguous().as_type(Dtype::Bfloat16);
+  Tensor dob = grad_out.contiguous().as_type(Dtype::Bfloat16);
+  TensorOptions bf = q.opts().with_dtype(Dtype::Bfloat16).with_req_grad(false);
+  TensorOptions fp = q.opts().with_dtype(Dtype::Float32).with_req_grad(false);
+  Tensor dQb = Tensor::empty(Shape({{B, Nq,  T_q, D}}), bf);
+  Tensor dKb = Tensor::empty(Shape({{B, Nkv, T_k, D}}), bf);
+  Tensor dVb = Tensor::empty(Shape({{B, Nkv, T_k, D}}), bf);
+  Tensor dq_gamma = Tensor::zeros(Shape({{D}}), fp);
+  Tensor dk_gamma = Tensor::zeros(Shape({{D}}), fp);
 
-  const auto& qs = q.stride().strides; const auto& ks = k.stride().strides;
-  const auto& vs = v.stride().strides; const auto& os = out.stride().strides;
-  const auto& dos = grad_out.stride().strides;
-  const int64_t lse_sB = Nq * T_q, lse_sH = T_q;
-  const int64_t dq_sB = Nq * T_q * D, dq_sH = T_q * D, dq_sM = D;
-  const int64_t dk_sB = Nkv * T_k * D, dk_sH = T_k * D, dk_sM = D;
   const int   cache_len = static_cast<int>(cos_sin_cache.shape().dims[0]);
   const float* qg = q_gamma.is_valid() ? q_gamma.data<float>() : nullptr;
   const float* kg = k_gamma.is_valid() ? k_gamma.data<float>() : nullptr;
 
   OwnTensor::cp::cuda::gqa_fused_rope_cp_backward(
-      q.data<float>(), qs[0], qs[2], qs[1],
-      k.data<float>(), ks[0], ks[2], ks[1],
-      v.data<float>(), vs[0], vs[2], vs[1],
-      out.data<float>(), os[0], os[2], os[1],
-      grad_out.data<float>(), dos[0], dos[2], dos[1],
-      lse.data<float>(), lse_sB, lse_sH,
+      qb.data<bfloat16_t>(), kb.data<bfloat16_t>(), vb.data<bfloat16_t>(),
       cos_sin_cache.data<float>(), qg, kg,
-      dQ.data<float>(), dq_sB, dq_sM, dq_sH,
-      dK.data<float>(), dk_sB, dk_sM, dk_sH,
-      dV.data<float>(), dk_sB, dk_sM, dk_sH,
+      ob.data<bfloat16_t>(), dob.data<bfloat16_t>(), lse.data<float>(),
+      dQb.data<bfloat16_t>(), dKb.data<bfloat16_t>(), dVb.data<bfloat16_t>(),
       dq_gamma.data<float>(), dk_gamma.data<float>(),
-      D_buf.data<float>(),
-      B, Nq, Nkv, T_q, T_k,
+      static_cast<int>(B), static_cast<int>(Nq), static_cast<int>(Nkv),
+      static_cast<int>(T_q), static_cast<int>(T_k), static_cast<int>(D), cache_len,
       q_d0, q_d1, k_d0, k_d1,
-      D, cache_len, is_causal, scale, eps);
-  return SDPARoPEBackwardResult{dQ, dK, dV, dq_gamma, dk_gamma};
+      eps, /*interleaved=*/false, is_causal, scale);
+  return SDPARoPEBackwardResult{
+      dQb.as_type(Dtype::Float32), dKb.as_type(Dtype::Float32), dVb.as_type(Dtype::Float32),
+      dq_gamma, dk_gamma};
 #else
   (void)q; (void)k; (void)v; (void)grad_out; (void)out; (void)lse;
   (void)is_causal; (void)scale; (void)q_d0; (void)q_d1; (void)k_d0; (void)k_d1;

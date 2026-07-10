@@ -74,11 +74,42 @@ MPI_LIBDIR := $(shell $(CXX) --showme:libdirs 2>/dev/null | tr ' ' '\n' | head -
 # =============================================================================
 INCLUDES := -I$(CP_ROOT) -I$(SCRIPTS_DIR) -I$(TENSOR_INC) -I$(PROFILER_INC) -I$(CUDA_INC) -DWITH_CUDA
 
+# CP fused-RoPE kernels (context_parallel/GQA_fused_{fwd,bwd}_sm103_cp.cu) + the
+# FusedRoPESDPA.h wrappers compile only under -DCP_FUSED_ROPE; the default build
+# leaves those TUs empty (no libtensor symbol collision). CP_ROPE_DEBUG adds the
+# out-of-range RoPE-index counter/check (bring-up only; adds a per-call sync).
+#   make CP_FUSED_ROPE=1 ...            enable the CP fused-RoPE path
+#   make CP_FUSED_ROPE=1 CP_ROPE_DEBUG=1 ...   + out-of-range checks
+ifeq ($(CP_FUSED_ROPE),1)
+  INCLUDES += -DCP_FUSED_ROPE
+endif
+ifeq ($(CP_ROPE_DEBUG),1)
+  INCLUDES += -DCP_ROPE_DEBUG
+endif
+
+# Make the CP-RoPE macro state a real build dependency, so flipping
+# CP_FUSED_ROPE / CP_ROPE_DEBUG rebuilds automatically (no manual `make clean`).
+# The stamp file's contents are rewritten ONLY when the flag string changes, so
+# its mtime bumps -> every object depending on it recompiles. Unchanged flags =>
+# no rewrite => no spurious rebuilds.
+CP_ROPE_STAMP := $(OBJDIR)/.cp_rope_flags
+CP_ROPE_STATE := CP_FUSED_ROPE=$(CP_FUSED_ROPE)|CP_ROPE_DEBUG=$(CP_ROPE_DEBUG)
+.PHONY: __cp_rope_flagcheck
+$(CP_ROPE_STAMP): __cp_rope_flagcheck
+	@mkdir -p $(@D)
+	@[ -f $@ ] && [ "$$(cat $@)" = "$(CP_ROPE_STATE)" ] || echo "$(CP_ROPE_STATE)" > $@
+
+# Automatic header-dependency tracking: -MMD emits a per-object .d file listing
+# every (non-system) header the TU pulled in; -MP adds phony targets so deleting
+# a header doesn't break the build. The .d files are -include'd below, so editing
+# ANY header recompiles exactly the objects that include it -- no `make clean`.
+DEPFLAGS := -MMD -MP
+
 # c++2a (C++20) matches BluTrain/Makefile; checkpointing/Checkpointing.h uses
 # C++20 std::string::starts_with/ends_with.
-CXXFLAGS  := -std=c++2a -fPIC -O3 -g $(INCLUDES)
+CXXFLAGS  := -std=c++2a -fPIC -O3 -g $(DEPFLAGS) $(INCLUDES)
 NVCCFLAGS := -std=c++17 -Xcompiler="-fPIC" -arch=sm_$(SM_ARCH) -O3 -g \
-             --use_fast_math --expt-relaxed-constexpr -ccbin=$(CXX) $(INCLUDES)
+             --use_fast_math --expt-relaxed-constexpr -ccbin=$(CXX) $(DEPFLAGS) $(INCLUDES)
 
 LINKFLAGS := -std=c++17 -Xcompiler="-fPIC" -arch=sm_$(SM_ARCH) -O3 -g -ccbin=$(CXX)
 
@@ -147,17 +178,21 @@ $(TARGET): $(ALL_OBJECTS) | $(TENSOR_LIB_A) $(PROFILER_LIB)
 	        $(LDLIBS) $(LINK_MEMFLAGS)
 	@echo -e "[SUCCESS] $@\n\nRun with: make run NP=2"
 
-# C++ objects (host / MPI)
-$(OBJDIR)/%.o: %.cpp
+# C++ objects (host / MPI). $(CP_ROPE_STAMP) prereq => flag flips force a rebuild.
+$(OBJDIR)/%.o: %.cpp $(CP_ROPE_STAMP)
 	@mkdir -p $(@D)
 	@echo "Compiling [CXX  | cp]: $<"
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # CUDA objects
-$(OBJDIR)/%.o: %.cu
+$(OBJDIR)/%.o: %.cu $(CP_ROPE_STAMP)
 	@mkdir -p $(@D)
 	@echo "Compiling [CUDA | cp]: $<"
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+# Pull in the auto-generated header dependencies (*.d) for every built object.
+# Absent on a clean tree (nothing built yet) -> the leading '-' ignores that.
+-include $(shell find $(OBJDIR) -name '*.d' 2>/dev/null)
 
 # =============================================================================
 # libprofiler -- pure host-C++ shared lib (no Makefile in BluTrain/Profiler)
@@ -219,6 +254,27 @@ run-cp-rope-standin: $(STANDIN_EXE)
 	@echo "--- Running stand-in parity on $(NP) rank(s) ---"
 	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
 	    mpirun -np $(NP) ./$(STANDIN_EXE) $(ARGS)
+
+# ---- Phase 3 FUSED RoPE kernel parity (single GPU; needs CP_FUSED_ROPE=1). ----
+# Build: make CP_FUSED_ROPE=1 CP_ROPE_DEBUG=1 cp-rope-fused
+# Run:   make run-cp-rope-fused   (single process, no MPI ring)
+FUSED_SRC := Tests/cp_rope_fused_parity.cpp
+FUSED_OBJ := $(OBJDIR)/Tests/cp_rope_fused_parity.o
+FUSED_EXE := $(BINDIR)/cp_rope_fused_parity_exec
+.PHONY: cp-rope-fused run-cp-rope-fused
+cp-rope-fused: $(FUSED_EXE)
+$(FUSED_EXE): $(FUSED_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) | $(TENSOR_LIB_A) $(PROFILER_LIB)
+	@mkdir -p $(BINDIR)
+	@echo -e "\n--- Linking fused RoPE parity test (sm_$(SM_ARCH)): $@"
+	$(NVCC) $(LINKFLAGS) $(LDFLAGS) -o $@ \
+	        $(FUSED_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) \
+	        -Xlinker --start-group $(TENSOR_LIB_A) -Xlinker --end-group \
+	        $(LDLIBS) $(LINK_MEMFLAGS)
+
+run-cp-rope-fused: $(FUSED_EXE)
+	@echo "--- Running fused RoPE parity (single GPU) ---"
+	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
+	    ./$(FUSED_EXE) $(ARGS)
 
 # =============================================================================
 # Ulysses (DeepSpeed-style) CP attention parity test (additive; new target).

@@ -642,6 +642,15 @@ public:
       // RoPE path (additive, gated): when this CP layer wraps the fused
       // RoPE kernel, derive the 4 per-side deltas and call the RoPE wrapper.
       // Default (use_rope_==false, GPT-2/wpe) takes the EXACT existing call.
+      //
+      // >>> CONTRACT with the fused CP kernel (GQA_fused_*_sm103_cp.cu): the
+      // >>> kernel does causal masking on LOCAL indices only. That is correct
+      // >>> ONLY because this sub-chunk slicing (Full / KHeadHalf / QTailHalf)
+      // >>> keeps each ring step's tensor LOCALLY MONOTONIC (local order ==
+      // >>> relative global order) and sets use_causal per step. If you change
+      // >>> how sub-chunks are sliced here, you MUST re-confirm that invariant
+      // >>> or the fused kernel's mask becomes SILENTLY wrong. The 4 deltas
+      // >>> below drive RoPE cache indexing ONLY, never masking. <<<
       SDPAResult result;
       if (use_rope_) {
         OwnTensor::cp::SubChunk sc =
