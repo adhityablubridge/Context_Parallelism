@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ProcessGroupNCCL.h"   // canonical BluTrain PG (via -IBluTrain/dist/communication/include)
+#include "CPLog.h"              // cplog::log_rank() — gate one-time notices to rank 0
 #include "core/Tensor.h"
 #include "device/CachingCudaAllocator.h"
 #include <vector>
@@ -117,7 +118,7 @@ public:
         slot_ ^= 1;  // receive into the free slot
         {
             static bool _once = false;
-            if (!_once) { _once = true;
+            if (!_once && cplog::log_rank()) { _once = true;
                 fprintf(stderr, "[CP ring P2P] %s\n", overlap
                     ? "OVERLAP: dedicated non-blocking stream"
                     : "NO-OVERLAP: shared blocking stream"); }
@@ -243,7 +244,7 @@ public:
         slot_ ^= 1;
         {
             static bool _once = false;
-            if (!_once) { _once = true;
+            if (!_once && cplog::log_rank()) { _once = true;
                 fprintf(stderr, "[CP ring A2A] %s\n", overlap
                     ? "OVERLAP: dedicated non-blocking stream"
                     : "NO-OVERLAP: shared blocking stream"); }
@@ -348,7 +349,7 @@ public:
         {
             // One-time confirmation of which forward ring path is active.
             static bool _once = false;
-            if (!_once) { _once = true;
+            if (!_once && cplog::log_rank()) { _once = true;
                 fprintf(stderr, "[CP ring AllGather] %s\n", overlap
                     ? "OVERLAP: async all_gather on dedicated ring stream"
                     : "NO-OVERLAP: blocking all_gather on shared stream"); }

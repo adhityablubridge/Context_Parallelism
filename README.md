@@ -232,6 +232,17 @@ CP_ATTN_MODE=ulysses CP_DATA_ROOT=/path/to/shards \
 | `CP_WARMUP` | 715 | LR warmup steps. |
 | `CP_DATA_ROOT` | (hardcoded path) | Token-shard directory (train/val `*.bin`, uint16). |
 
+**Checkpointing / resume / LR re-warmup** — checkpoints go to `checkpoints_bluscriptcp/blumodelcp_run<N>_step_<S>.ckpt`; the run number `N` ties the CSV log (`CP_Training_logs/CP_Training_log<N>.csv`) and the checkpoint prefix, and is echoed at startup (`Checkpointing: ON -> …`).
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `CP_CKPT` | 1 | Enable periodic checkpointing (`0` to disable). |
+| `CP_CKPT_FREQ` | 250 | Save every N steps (plus the final step). **First save is at step N** — with the default 250 nothing is written before then. |
+| `CP_CKPT_NEW_RUN=1` | – | Force a fresh run number even if a resumable checkpoint exists. |
+| `CP_CKPT_RESUME=<N>` | auto | Resume run number `N` explicitly (honored regardless of completeness); otherwise auto-resume the latest **incomplete** run (top step `< CP_MAX_STEPS`). |
+| `CP_REWARMUP` | 0 | **Resume-only** (`start_step > 0`): re-anchor a fresh LR warmup of this many steps at the resume step. `0` keeps the continuous schedule (the base warmup is absolute from step 0 and cannot re-ramp). |
+| `CP_REWARMUP_PEAK` | 1.0 | Peak of the re-warmup as a fraction of the run's `max_lr` (6e-4). E.g. `0.3` for a reduced long-context peak. |
+
 **RoPE / YaRN context extension** (the shared `build_rope_cache`; `YARN_SCALE=1.0` ⇒ plain RoPE)
 
 | Var | Default | Effect |
@@ -239,6 +250,22 @@ CP_ATTN_MODE=ulysses CP_DATA_ROOT=/path/to/shards \
 | `YARN_SCALE` | 1.0 | Context-extension factor; set to `target_ctx / orig_ctx`. |
 | `YARN_ORIG_MAXPOS` | 1024 | Original pretrain context length. |
 | `YARN_BETA_FAST` / `YARN_BETA_SLOW` | 32 / 1 | NTK-by-parts correction bounds. |
+
+`build_rope_cache` prints `[YaRN] … scale=<s>` at model init — `scale=1.000` means YaRN is **off**. Keep `CP_T == YARN_SCALE · YARN_ORIG_MAXPOS` or it warns that the cache is sized for a different context than it is scaled for.
+
+**2-stage context extension (YaRN + re-warmup).** To extend a model from `orig_ctx` to a longer context, run two stages rather than changing `CP_T` at peak LR (which meets the context-shift perplexity spike with full-strength updates):
+
+1. **Base stage** — train at `CP_T=orig_ctx` and let the LR **decay** (don't stop at peak); checkpoint via `CP_CKPT_FREQ`.
+2. **Long-context stage** — resume with the extended `CP_T`, YaRN on, and a fresh **re-warmup to a reduced peak** so the spike is met with a gentle, rising LR:
+
+   ```bash
+   CP_T=4096 YARN_SCALE=4 YARN_ORIG_MAXPOS=1024 \
+   CP_CKPT_RESUME=<run> CP_MAX_STEPS=<new_target> \
+   CP_REWARMUP=<W> CP_REWARMUP_PEAK=0.3 \
+       make CP_FUSED_ROPE=1 run-bluscript-cp NP=<n>
+   ```
+
+   Model params are sequence-length- and world-size-independent (RoPE positions are computed, not learned), so the extended `CP_T` — and even a different world size — loads the same checkpoint; the RoPE cache is rebuilt from the YaRN env. Keep the architecture (`d_model` / heads / kv / layers / vocab) identical. Set `CP_MAX_STEPS` above the base-stage step (or pass `CP_CKPT_RESUME`) so the run is treated as incomplete — otherwise a completed run starts fresh instead of resuming.
 
 **Diagnostics (ring) + device mapping**
 

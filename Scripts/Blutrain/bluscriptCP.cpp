@@ -83,6 +83,13 @@ struct CudaTimer {
     double get_elapsed_seconds() { return get_elapsed_ms() / 1000.0; }
 };
 
+// Discards all output — used to temporarily silence the DataLoader's per-shard
+// debug prints during the resume fast-forward (skip_batches), which otherwise
+// spam one line per shard crossing, per rank.
+struct NullBuf : std::streambuf {
+    int overflow(int c) override { return c; }
+};
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -120,14 +127,14 @@ struct ModelConfig {
 
     // ---- context parallel (env-resolved in main) ----
     int         cp_size    = 2;                          // sequence-parallel group size (CP_SIZE)
-    std::string attn_mode  = "ring";                     // "ring" | "ulysses" (CP_ATTN_MODE)
-    RotatorType rotator    = RotatorType::AlltoAll;      // CP_ROTATOR
+    std::string attn_mode  = "ulysses";                     // "ring" | "ulysses" (CP_ATTN_MODE)
+    RotatorType rotator    = RotatorType::P2P;      // CP_ROTATOR
     bool        ring_mode  = true;                       // (attn_mode == "ring") -> HeadTail LB
 
     // ---- checkpointing ----
     bool        checkpointing = true;
-    int         ckpt_freq     = 250;
-    int         ckpt_keep     = 5;
+    int         ckpt_freq     = 50;
+    int         ckpt_keep     = 6;
     std::string ckpt_dir      = "checkpoints_bluscriptcp";
     std::string ckpt_prefix   = "blumodelcp";
 };
@@ -367,10 +374,21 @@ public:
 // =============================================================================
 // Cosine LR schedule (unchanged).
 // =============================================================================
-static float get_lr(int step, float max_lr, float min_lr, int warmup, int max_steps) {
-    if (step < warmup)     return max_lr * static_cast<float>(step + 1) / static_cast<float>(warmup);
+// Cosine LR with warmup. `warmup_start` anchors the warmup ramp: 0 for a fresh
+// run, or the resume step for a 2-stage re-warmup on context extension (ramp
+// [warmup_start, warmup_start+warmup), then cosine-decay to min_lr by max_steps).
+// `max_lr` is the (possibly reduced) peak reached at the top of the ramp.
+static float get_lr(int step, float max_lr, float min_lr, int warmup, int max_steps,
+                    int warmup_start = 0) {
+    if (max_lr < min_lr) max_lr = min_lr;                    // guard: absurdly low peak -> constant min
+    const int local = step - warmup_start;                  // steps since the (re)warmup anchor
+    if (warmup > 0 && local < warmup)
+        return max_lr * static_cast<float>(local + 1) / static_cast<float>(warmup);
     if (step >= max_steps) return min_lr;
-    const float decay = static_cast<float>(step - warmup) / static_cast<float>(max_steps - warmup);
+    const int   decay_start = warmup_start + warmup;
+    float denom = static_cast<float>(max_steps - decay_start);
+    if (denom <= 0.0f) denom = 1.0f;                         // guard: warmup window past max_steps
+    const float decay = static_cast<float>(step - decay_start) / denom;
     const float coeff = 0.5f * (1.0f + std::cos(M_PI * decay));
     return min_lr + coeff * (max_lr - min_lr);
 }
@@ -389,6 +407,13 @@ int main(int argc, char** argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     const bool is_master = (rank == 0);
 
+    // Only rank 0 writes to stdout. Redirect std::cout on every other rank to a
+    // discard buffer so un-gated library chatter (CheckpointManager auto-load, CP
+    // ring/overlap notices, etc.) is emitted once instead of world_size times.
+    // std::cerr is left intact so genuine errors/warnings from any rank still show.
+    static NullBuf global_null_buf;
+    if (!is_master) std::cout.rdbuf(&global_null_buf);
+
     if (is_master)
         std::cout << "=== Llama Context Parallel Training Script (bluscriptCP) ==="
                   << std::endl;
@@ -405,12 +430,31 @@ int main(int argc, char** argv) {
     if (!cfg.ring_mode && is_master)
         std::cout << "[CP attn mode] ULYSSES (all-to-all); load_balancing forced "
                      "off (contiguous sharding)\n";
+    std::string rotator_label = "p2p";
     if (const char* e = std::getenv("CP_ROTATOR")) {
         std::string rv = e;
-        if      (rv == "p2p"       || rv == "P2P")       cfg.rotator = RotatorType::P2P;
-        else if (rv == "allgather" || rv == "AllGather") cfg.rotator = RotatorType::AllGather;
-        else                                             cfg.rotator = RotatorType::AlltoAll;
+        if      (rv == "p2p"       || rv == "P2P")       { cfg.rotator = RotatorType::P2P;       rotator_label = "p2p"; }
+        else if (rv == "allgather" || rv == "AllGather") { cfg.rotator = RotatorType::AllGather; rotator_label = "allgather"; }
+        else                                             { cfg.rotator = RotatorType::AlltoAll; rotator_label = "alltoall"; }
     }
+    // Under Ulysses the ring rotator is unused (all-to-all attention); tag the
+    // snapshot with "ulysses" so it matches the sweep harness's filename.
+    if (!cfg.ring_mode) rotator_label = "ulysses";
+
+    // ---- memory-occupancy probe (mirrors gpt2_cp_test.cpp) ----
+    //   CP_MEM_PROBE=1     : run CP_MEM_PROBE_STEPS steps (grad_accum forced to 1),
+    //                        skip validation + checkpointing, snapshot nvidia-smi +
+    //                        cudaMemGetInfo + allocator stats after the last step,
+    //                        then exit. Used by Tests/bluscriptcp/mem_scaling_sweep.sh.
+    //   CP_MEM_PROBE_STEPS : steps in probe mode (default 2; must be >=2 so the
+    //                        optimizer-state allocation is counted).
+    //   CP_MODEL_LABEL     : free-text label embedded in the snapshot (e.g. "48M").
+    const bool mem_probe = std::getenv("CP_MEM_PROBE") != nullptr &&
+                           std::atoi(std::getenv("CP_MEM_PROBE")) != 0;
+    const int mem_probe_steps =
+        std::getenv("CP_MEM_PROBE_STEPS") ? std::atoi(std::getenv("CP_MEM_PROBE_STEPS")) : 2;
+    const std::string mem_label =
+        std::getenv("CP_MODEL_LABEL") ? std::getenv("CP_MODEL_LABEL") : "bluscriptcp";
     // Optional config overrides (smoke tests / scaling).
     cfg.T = cfg.context_length = env_i64("CP_T", cfg.context_length);
     cfg.d_model   = env_i64("CP_N_EMBD",  cfg.d_model);
@@ -432,6 +476,15 @@ int main(int argc, char** argv) {
     // Resume a specific run number (>=0); -1 = auto-resume latest incomplete run.
     int ckpt_resume_run = -1;
     if (const char* e = std::getenv("CP_CKPT_RESUME")) ckpt_resume_run = std::atoi(e);
+
+    // 2-stage re-warmup for context extension: on a RESUMING run, re-anchor a fresh
+    // warmup ramp at the resume step (the base-context schedule's warmup is absolute
+    // from step 0, so it cannot ramp again). CP_REWARMUP=<steps> (0 = off; only
+    // applies when start_step>0). CP_REWARMUP_PEAK=<fraction of max_lr> gives a
+    // reduced peak for the long-context phase (default 1.0 = same peak).
+    const int rewarmup_steps = static_cast<int>(env_i64("CP_REWARMUP", 0));
+    float rewarmup_peak_frac = 1.0f;
+    if (const char* e = std::getenv("CP_REWARMUP_PEAK")) rewarmup_peak_frac = std::atof(e);
 
     // ---- LOUD invariant asserts (silent-failure guards) ----
     auto die = [&](const std::string& msg) {
@@ -455,6 +508,16 @@ int main(int argc, char** argv) {
         die("head_dim must be 64 or 128 (fused kernel)");
     if (cfg.q_heads % cfg.kv_heads != 0)
         die("q_heads must be a multiple of kv_heads");
+
+    // Probe mode: one micro-batch of B*T*dp_size tokens (grad_accum=1) captures the
+    // per-microstep peak faithfully (the accum loop is sequential), runs fast, and
+    // skips checkpointing/validation. max_steps>=2 so optimizer state is allocated.
+    if (mem_probe) {
+        cfg.global_batch  = cfg.B * cfg.T * static_cast<int64_t>(dp_size);
+        cfg.max_steps     = mem_probe_steps;
+        cfg.warmup_steps  = 1;
+        cfg.checkpointing = false;
+    }
 
     // Tokens per optimizer step: CP shares the batch (no data factor); DP multiplies.
     const int64_t tokens_per_micro = cfg.B * cfg.T * static_cast<int64_t>(dp_size);
@@ -489,6 +552,8 @@ int main(int argc, char** argv) {
                   << "  global_batch    : " << cfg.global_batch << "  (grad_accum=" << GRAD_ACCUM << ")\n"
                   << "  max_lr/min_lr   : " << cfg.max_lr << " / " << cfg.min_lr << "\n"
                   << "  warmup/steps    : " << cfg.warmup_steps << " / " << cfg.max_steps << "\n"
+                  << "  checkpointing   : " << (cfg.checkpointing ? "true" : "false")
+                  << "  (ckpt_freq=" << cfg.ckpt_freq << ", dir=" << cfg.ckpt_dir << ")\n"
                   << "=============================================================" << std::endl;
     }
 
@@ -539,7 +604,7 @@ int main(int argc, char** argv) {
     float last_val_loss = -1.0f;
 
     // ── Run-numbered logging + checkpoints (mirrors gpt2_cp_test.cpp) ─────────
-    // run_number governs BOTH the CSV log index (CP_Training_logs/CP_Training_log
+    // run_number governs BOTH the CSV log index (CP_BluScreipt_Training_logs/CP_Training_log
     // <N>.csv) AND the checkpoint filename prefix (blumodelcp_run<N>_step_<S>.ckpt).
     // Resolved on rank 0 (needs filesystem scans), then broadcast so every rank
     // builds the same prefix. When resuming, run_number is kept (log is appended).
@@ -549,9 +614,9 @@ int main(int argc, char** argv) {
     bool ckpt_resuming = false;   // rank-0 decision; broadcast below
 
     if (is_master) {
-        std::filesystem::create_directories("CP_Training_logs");
+        std::filesystem::create_directories("CP_BluScreipt_Training_logs");
         int next_free_log = 1;
-        while (std::filesystem::exists("CP_Training_logs/CP_Training_log" +
+        while (std::filesystem::exists("CP_BluScreipt_Training_logs/CP_Training_log" +
                                        std::to_string(next_free_log) + ".csv"))
             next_free_log++;
 
@@ -596,12 +661,12 @@ int main(int argc, char** argv) {
         if (resume_run >= 0) { run_number = resume_run; ckpt_resuming = true; }
         else                 { run_number = next_free_log; }
 
-        log_filename = "CP_Training_logs/CP_Training_log" + std::to_string(run_number) + ".csv";
+        log_filename = "CP_BluScreipt_Training_logs/CP_Training_log" + std::to_string(run_number) + ".csv";
         const bool log_exists = std::filesystem::exists(log_filename);
         std::cout << "Saving logs to: " << log_filename
                   << (ckpt_resuming ? " (resume run " : " (run ") << run_number << ")\n";
 
-        config_filename = "CP_Training_logs/CP_Training_log" + std::to_string(run_number) + "_config.txt";
+        config_filename = "CP_BluScreipt_Training_logs/CP_Training_log" + std::to_string(run_number) + "_config.txt";
         std::ofstream config_file(config_filename,
                                   (ckpt_resuming && log_exists) ? std::ios::app : std::ios::out);
         if (ckpt_resuming && log_exists)
@@ -663,6 +728,14 @@ int main(int argc, char** argv) {
     int start_step = 0;
     CheckpointManager ckpt(cfg.ckpt_dir, run_prefix, cfg.ckpt_keep, rank,
                            /*shard_dir=*/false, /*use_async=*/false);
+    if (is_master) {
+        if (cfg.checkpointing)
+            std::cout << "Checkpointing: ON -> " << cfg.ckpt_dir << "/" << run_prefix
+                      << "_step_<N>.ckpt (every " << cfg.ckpt_freq << " steps, keep "
+                      << cfg.ckpt_keep << ")\n";
+        else
+            std::cout << "Checkpointing: OFF\n";
+    }
     if (cfg.checkpointing) {
         float resume_loss = 0.0f;
         if (ckpt.load_latest(model, optimizer, start_step, resume_loss)) {
@@ -671,8 +744,49 @@ int main(int argc, char** argv) {
                           << " (loss " << resume_loss << ")" << std::endl;
             const size_t batches_to_skip =
                 static_cast<size_t>(start_step) * static_cast<size_t>(GRAD_ACCUM);
-            if (batches_to_skip > 0) train_loader.skip_batches(batches_to_skip);
+            if (batches_to_skip > 0) {
+                // Silence the per-shard-crossing debug spam during the replay, then
+                // emit a single line summarizing where the loader was fast-forwarded to.
+                static NullBuf null_buf;
+                std::streambuf* prev = std::cout.rdbuf(&null_buf);
+                train_loader.skip_batches(batches_to_skip);
+                std::cout.rdbuf(prev);
+                if (is_master)
+                    std::cout << "[resume] fast-forwarded data loader " << batches_to_skip
+                              << " batches (" << (static_cast<size_t>(start_step) *
+                                 static_cast<size_t>(cfg.global_batch))
+                              << " tokens)" << std::endl;
+            }
         }
+    }
+
+    // Effective LR schedule: on a resuming run with CP_REWARMUP>0, ramp a fresh
+    // warmup to a (possibly reduced) peak, then cosine-decay to min_lr by
+    // max_steps. Otherwise the original absolute-from-0 schedule.
+    //
+    // The ramp anchor MUST be a fixed absolute step (the step the extension
+    // warmup first began at), NOT the current resume step -- otherwise every
+    // resume of the extension re-anchors a fresh ramp and warmup restarts.
+    // CP_REWARMUP_ANCHOR=<step> pins it; default (-1) falls back to start_step
+    // (correct only on the very first extension resume). Read it once, then
+    // reuse the SAME value on every subsequent resume of the extension run.
+    const int rewarmup_anchor_env = static_cast<int>(env_i64("CP_REWARMUP_ANCHOR", -1));
+    const bool  rewarmup_active = (rewarmup_steps > 0 && start_step > 0);
+    const int   lr_warmup_start = rewarmup_active
+                                    ? (rewarmup_anchor_env >= 0 ? rewarmup_anchor_env : start_step)
+                                    : 0;
+    const int   lr_warmup       = rewarmup_active ? rewarmup_steps    : cfg.warmup_steps;
+    const float lr_peak         = rewarmup_active ? (rewarmup_peak_frac * cfg.max_lr) : cfg.max_lr;
+    if (is_master && rewarmup_active) {
+        const int steps_into_ramp = start_step - lr_warmup_start;
+        std::cout << "[re-warmup] anchored at step " << lr_warmup_start << " for " << rewarmup_steps
+                  << " steps -> peak " << lr_peak << " (" << rewarmup_peak_frac
+                  << " x max_lr), then cosine-decay to " << cfg.min_lr
+                  << " | resuming at step " << start_step << " ("
+                  << (steps_into_ramp >= rewarmup_steps ? "past ramp, in cosine-decay"
+                      : (steps_into_ramp < 0 ? "BEFORE anchor -- check CP_REWARMUP_ANCHOR"
+                                             : "mid-ramp"))
+                  << ")" << std::endl;
     }
 
     // Per-phase event timers (data/fwd/loss/bwd/clip/optim) + whole-step timer,
@@ -685,7 +799,7 @@ int main(int argc, char** argv) {
         timer_step.start_timer();
 
         // ---------- periodic validation (local shard loss + global avg) ----------
-        if (step % cfg.val_freq == 0 || step == cfg.max_steps - 1) {
+        if (!mem_probe && (step % cfg.val_freq == 0 || step == cfg.max_steps - 1)) {
             autograd::NoGradGuard no_grad;
             val_loader.reset();
             float val_accum = 0.0f;
@@ -756,7 +870,7 @@ int main(int argc, char** argv) {
         const float grad_norm = nn::clip_grad_norm_(params, cfg.grad_clip);
         time_clip = timer_clip.get_elapsed_seconds();
 
-        const float lr = get_lr(step, cfg.max_lr, cfg.min_lr, cfg.warmup_steps, cfg.max_steps);
+        const float lr = get_lr(step, lr_peak, cfg.min_lr, lr_warmup, cfg.max_steps, lr_warmup_start);
         optimizer.set_lr(lr);
         timer_optim.start_timer();
         const float wd_factor = 1.0f - lr * cfg.weight_decay;
@@ -802,6 +916,101 @@ int main(int argc, char** argv) {
                      << (time_clip * 1000.0) << "," << (time_optim * 1000.0) << ","
                      << used_mb << "\n";
             log_file.flush();
+        }
+
+        // ── Memory-probe snapshot: after the final probe step, capture nvidia-smi
+        //    + cudaMemGetInfo + allocator stats (live, before teardown), then stop.
+        //    Same snapshot format as gpt2_cp_test.cpp so mem_scaling_table.py parses
+        //    both. tag = CPP_<label>_<rotator>_T<T>_ws<ws>.txt. ────────────────────
+        if (mem_probe && step == cfg.max_steps - 1) {
+            cudaDeviceSynchronize();
+            size_t pf = 0, pt = 0;
+            cudaMemGetInfo(&pf, &pt);
+            const double probe_used_mb = static_cast<double>(pt - pf) / (1024.0 * 1024.0);
+            auto mstats = CachingCUDAAllocator::instance().get_stats(rank);
+            const double MB = 1024.0 * 1024.0;
+            const double st_reserved_mb  = mstats.reserved_current / MB;
+            const double st_active_mb    = mstats.active_current / MB;
+            const double st_requested_mb = mstats.allocated_current / MB;
+            const double st_frag_pct     = mstats.fragmentation_ratio();
+            const double st_active_peak_mb   = mstats.active_peak / MB;
+            const double st_reserved_peak_mb = mstats.reserved_peak / MB;
+            const double st_cached_free_mb =
+                (mstats.reserved_current > mstats.active_current)
+                    ? (mstats.reserved_current - mstats.active_current) / MB : 0.0;
+            const std::string tag = "CPP_" + mem_label + "_" + rotator_label + "_T" +
+                                    std::to_string(cfg.T) + "_ws" + std::to_string(world_size);
+            std::cout << "[MEM_PROBE rank=" << rank << "] tag=" << tag
+                      << " used_mb=" << std::fixed << std::setprecision(1)
+                      << probe_used_mb << "\n";
+            if (is_master) {
+                const char* sd = std::getenv("MEM_SNAPSHOT_DIR");
+                const std::string snap_dir = sd ? sd : "mem_scaling_runs";
+                std::filesystem::create_directories(snap_dir);
+                const std::string snap_path = snap_dir + "/" + tag + ".txt";
+                std::ofstream sf(snap_path);
+                sf << "# MEM PROBE SNAPSHOT  tag=" << tag << "\n";
+                sf << "# impl=Cpp label=" << mem_label << " rotator=" << rotator_label
+                   << " n_embd=" << cfg.d_model << " n_layer=" << cfg.n_layers
+                   << " n_head=" << cfg.q_heads
+                   << " weight_tying=" << (cfg.weight_tying ? 1 : 0) << "\n";
+                sf << "# B=" << cfg.B << " T=" << cfg.T
+                   << " cp_world_size=" << world_size << " params=" << num_params << "\n";
+                sf << "# cudaMemGetInfo used_mb(rank0)=" << std::fixed
+                   << std::setprecision(1) << probe_used_mb << "\n";
+                sf << "# ALLOC reserved_mb=" << std::fixed << std::setprecision(1)
+                   << st_reserved_mb << " active_mb=" << st_active_mb
+                   << " requested_mb=" << st_requested_mb
+                   << " cached_free_mb=" << st_cached_free_mb
+                   << " internal_frag_pct=" << std::setprecision(2) << st_frag_pct << "\n";
+                sf << "# ALLOC_PEAK active_peak_mb=" << std::fixed << std::setprecision(1)
+                   << st_active_peak_mb << " reserved_peak_mb=" << st_reserved_peak_mb << "\n";
+                // Machine-readable live per-GPU used MiB (parsed by the table gen).
+                // nvidia-smi ignores CUDA_VISIBLE_DEVICES; keep only this run's GPUs.
+                {
+                    std::string smi_used;
+                    std::vector<std::string> vis;
+                    if (const char* cvd = std::getenv("CUDA_VISIBLE_DEVICES")) {
+                        std::string s(cvd), cur;
+                        for (char c : s) {
+                            if (c == ',') { if (!cur.empty()) vis.push_back(cur); cur.clear(); }
+                            else if (c != ' ') cur += c;
+                        }
+                        if (!cur.empty()) vis.push_back(cur);
+                    }
+                    auto allowed = [&](const std::string& idx) {
+                        if (vis.empty()) return true;
+                        for (auto& v : vis) if (v == idx) return true;
+                        return false;
+                    };
+                    FILE* qp = popen("nvidia-smi --query-gpu=index,memory.used "
+                                     "--format=csv,noheader,nounits 2>/dev/null", "r");
+                    if (qp) {
+                        char buf[256];
+                        while (fgets(buf, sizeof(buf), qp)) {
+                            std::string ln(buf);
+                            while (!ln.empty() && (ln.back() == '\n' || ln.back() == '\r')) ln.pop_back();
+                            std::string cleaned;
+                            for (char c : ln) if (c != ' ') cleaned += c;
+                            if (cleaned.empty()) continue;
+                            const std::string idx = cleaned.substr(0, cleaned.find(','));
+                            if (!allowed(idx)) continue;
+                            if (!smi_used.empty()) smi_used += ";";
+                            smi_used += cleaned;
+                        }
+                        pclose(qp);
+                    }
+                    sf << "# SMI_USED_MB_PER_GPU=" << smi_used << "\n";
+                }
+                sf << "# ---- nvidia-smi ----\n";
+                sf.close();
+                const std::string cmd = "nvidia-smi >> '" + snap_path + "' 2>&1";
+                int rc = std::system(cmd.c_str());
+                (void)rc;
+                std::cout << "[MEM_PROBE] wrote snapshot " << snap_path << "\n";
+            }
+            MPI_Barrier(MPI_COMM_WORLD);
+            break;
         }
 
         if (cfg.checkpointing && is_master &&

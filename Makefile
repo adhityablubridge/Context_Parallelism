@@ -15,7 +15,7 @@ CP_ROOT     := .
 CP_DIR      := context_parallel
 PG_DIR      := process_group
 DL_DIR      := Data_Loader
-SCRIPTS_DIR := Scripts/BluTrain
+SCRIPTS_DIR := Scripts/Blutrain
 
 OBJDIR := build/objects
 BINDIR := build
@@ -293,8 +293,8 @@ run-cp-rope-fused: $(FUSED_EXE)
 # ---- bluscriptCP: context-parallel Llama training (DataParallel + ContextParallel
 #      on the unified PG). Ring path needs CP_FUSED_ROPE=1.
 # Build: make CP_FUSED_ROPE=1 bluscript-cp    Run: make CP_FUSED_ROPE=1 run-bluscript-cp NP=2
-BLUSCRIPT_SRC := Scripts/BluTrain/bluscriptCP.cpp
-BLUSCRIPT_OBJ := $(OBJDIR)/Scripts/BluTrain/bluscriptCP.o
+BLUSCRIPT_SRC := Scripts/Blutrain/bluscriptCP.cpp
+BLUSCRIPT_OBJ := $(OBJDIR)/Scripts/Blutrain/bluscriptCP.o
 BLUSCRIPT_EXE := $(BINDIR)/bluscriptCP_exec
 # DataParallel + its profiler dep — scoped to this target only (parity tests don't need them).
 BLUSCRIPT_DIST_SRCS := BluTrain/dist/Data-Parallel/src/DataParallel.cpp \

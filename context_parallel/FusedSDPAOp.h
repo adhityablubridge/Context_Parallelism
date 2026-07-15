@@ -36,6 +36,7 @@
 #include "context_parallel/FusedSDPABackwardKernel.h"
 #include "context_parallel/FusedSDPAKernel.h"
 #include "context_parallel/SDPAOp.h"
+#include "context_parallel/CPLog.h"   // cplog::log_rank() — gate one-time notices to rank 0
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -136,7 +137,7 @@ inline SDPAResult sdpa_fused_forward(Tensor &q, Tensor &k, Tensor &v,
     // [CP ring ...] prints). Set ATTN_FP32 (any value) to force the scalar fp32
     // kernel; UNSET to use the TF32 WMMA/cp.async TC path.
     static bool _fp32_once = false;
-    if (!_fp32_once) { _fp32_once = true;
+    if (!_fp32_once && cplog::log_rank()) { _fp32_once = true;
       fprintf(stderr, "[CP sdpa fwd] %s\n", attn_fp32
           ? "ATTN_FP32=on -> scalar fp32 kernel (no cp.async/WMMA)"
           : "ATTN_FP32=off -> TF32 WMMA/cp.async TC kernel"); }

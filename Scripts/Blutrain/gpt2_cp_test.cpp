@@ -655,7 +655,7 @@ int main(int argc, char **argv) {
     config.n_embd = fourtyfour?384:768;
     config.n_layers = fourtyfour?3:12;
     config.n_heads = fourtyfour?6:12;
-    config.weight_tying = false;
+    config.weight_tying = true;
     config.load_balancing = true;
 
     // ── Memory-scaling sweep overrides (env-driven) ────────────────────────
@@ -931,7 +931,7 @@ int main(int argc, char **argv) {
         std::cout << "Loaded NAMED init weights (" << recs.size()
                   << " records)\n";
     }
-    
+
     // ----- END NAME-AWARE INIT WEIGHT LOAD -----
 
     if (rank == 0) {
@@ -983,10 +983,10 @@ int main(int argc, char **argv) {
     bool ckpt_resuming = false;  // rank-0 decision; broadcast below
 
     if (rank == 0) {
-      std::filesystem::create_directories("CP_Training_logs");
+      std::filesystem::create_directories("CP_GPT2_Training_logs");
       // First free CP_Training_log{N}.csv index (used for a fresh run).
       int next_free_log = 1;
-      while (std::filesystem::exists("CP_Training_logs/CP_Training_log" +
+      while (std::filesystem::exists("CP_GPT2_Training_logs/CP_Training_log" +
                                      std::to_string(next_free_log) + ".csv")) {
         next_free_log++;
       }
@@ -1056,14 +1056,14 @@ int main(int argc, char **argv) {
         run_number = next_free_log;
       }
 
-      log_filename = "CP_Training_logs/CP_Training_log" +
+      log_filename = "CP_GPT2_Training_logs/CP_Training_log" +
                      std::to_string(run_number) + ".csv";
       const bool log_exists = std::filesystem::exists(log_filename);
       std::cout << "Saving logs to: " << log_filename
                 << (ckpt_resuming ? " (resume run " : " (run ")
                 << run_number << ")\n";
 
-      config_filename = "CP_Training_logs/CP_Training_log" +
+      config_filename = "CP_GPT2_Training_logs/CP_Training_log" +
                         std::to_string(run_number) + "_config.txt";
       std::ofstream config_file(
           config_filename,

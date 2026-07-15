@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>   // std::getenv, std::atof
 #include <cstdio>    // std::fprintf
+#include "CPLog.h"    // cplog::log_rank() — gate one-time notices to rank 0
 #include <string>    // std::to_string
 #include <algorithm> // std::max, std::min
 
@@ -86,7 +87,7 @@ Tensor build_rope_cache(int64_t seq_len, int64_t head_dim, float base, DeviceInd
 
     // (R2) scale <-> seq_len consistency (warn, don't hard-fail).
     if (s > 1.0f && std::abs(static_cast<float>(seq_len) - s * L) > 1.0f) {
-        std::fprintf(stderr,
+        if (cplog::log_rank()) std::fprintf(stderr,
             "[YaRN][warn] seq_len(%lld) != scale(%.3f)*orig_maxpos(%.1f)=%.1f "
             "-- cache scaled for a different context than it is sized for\n",
             (long long)seq_len, s, L, s * L);
@@ -94,7 +95,7 @@ Tensor build_rope_cache(int64_t seq_len, int64_t head_dim, float base, DeviceInd
 
     // (R3) Init log: makes the active config + the YARNOps-symbol-wins link
     // dependency visible. Missing line / scale=1 => silent revert to std RoPE.
-    std::fprintf(stderr,
+    if (cplog::log_rank()) std::fprintf(stderr,
         "[YaRN] build_rope_cache: seq_len=%lld hd=%lld scale=%.3f low=%lld high=%lld m=%.4f\n",
         (long long)seq_len, (long long)head_dim, s, (long long)low, (long long)high, m);
 

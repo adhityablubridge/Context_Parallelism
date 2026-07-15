@@ -5,6 +5,7 @@
 #include "autograd/ops_template.h"
 #include "core/Tensor.h"
 #include "ProcessGroupNCCL.h"   // canonical BluTrain PG (via -IBluTrain/dist/communication/include)
+#include "CPLog.h"              // cplog::log_rank() — gate one-time notices to rank 0
 // #include "tensor/dtensor.h"
 #include "context_parallel/LoadBalancer.h"
 
@@ -250,7 +251,7 @@ public:
         OVERLAP = false;
     {
       static bool _once = false;
-      if (!_once) { _once = true;
+      if (!_once && cplog::log_rank()) { _once = true;
         fprintf(stderr, "[CP bwd] overlap=%s\n", OVERLAP ? "ON" : "OFF"); }
     }
     cudaStream_t compute_stream = OwnTensor::cuda::getCurrentStream();
