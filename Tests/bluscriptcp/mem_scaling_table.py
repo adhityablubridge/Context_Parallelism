@@ -2,19 +2,20 @@
 """
 mem_scaling_table.py — aggregate memory-scaling snapshots into a table.
 
-Reads the per-run snapshot files written by the probe mode of both scripts
-(PT_*.txt / CPP_*.txt) plus the sweep's mem_scaling_results.csv (for OOM rows),
-and emits a tidy CSV + a Markdown comparison table.
+Pairs OUR bluscriptCP (C++ CP-Ulysses) against the DeepSpeed-Ulysses Qwen3
+reference. Reads the per-run snapshot files written by mem_scaling_sweep.sh
+(CPP_*.txt / DS_*.txt) plus mem_scaling_results.csv (for OOM rows), and emits a
+tidy CSV + Markdown comparison table and a max-T-before-OOM limits summary.
 
 Usage:
-    python3 mem_scaling_table.py [OUT_DIR]     # default OUT_DIR=mem_scaling_runs
+    python3 mem_scaling_table.py [OUT_DIR]   # default OUT_DIR=mem_scaling_runs_bluscriptcp
 """
 import os
 import re
 import sys
 import csv
 
-OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "mem_scaling_runs"
+OUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "mem_scaling_runs_bluscriptcp"
 
 
 def parse_snapshot(path):
@@ -72,7 +73,8 @@ def main():
 
     records = []
     for fn in sorted(os.listdir(OUT_DIR)):
-        if fn.endswith(".txt") and (fn.startswith("PT_") or fn.startswith("CPP_")):
+        if fn.endswith(".txt") and (fn.startswith("CPP_") or
+                                    fn.startswith("DSQ_") or fn.startswith("DSG_")):
             records.append(parse_snapshot(os.path.join(OUT_DIR, fn)))
 
     # Fold in OOM rows from results.csv (runs that produced no snapshot).
@@ -98,9 +100,8 @@ def main():
                             "smi_max_used_mb": "", "status": "OOM",
                         })
 
-    # Collapse the two per-impl native metrics into a single peak_mb column so
-    # there are no design-blank cells: PyTorch -> torch peak reserved, C++ ->
-    # cudaMemGetInfo used. peak_src records which metric was used.
+    # Collapse each impl's native peak metric into a single peak_mb column:
+    # bluscriptCP -> cudaMemGetInfo used; DS-Ulysses -> torch peak reserved.
     for r in records:
         if r.get("torch_peak_reserved_mb"):
             r["peak_mb"] = r["torch_peak_reserved_mb"]
@@ -115,11 +116,23 @@ def main():
     # Drop any stray record with no rotator (e.g. a pre-rotator smoke test).
     records = [r for r in records if r.get("rotator") or r.get("status") == "OOM"]
 
-    # Normalize impl names: OK snapshots use "Cpp"/"PyTorch", OOM rows from the
-    # sweep CSV use "CPP"/"PT". Collapse to one canonical name so OK and OOM
-    # rows for the same config merge into a single limits entry.
+    # Normalize impl names so OK snapshots and OOM CSV rows for the same config
+    # merge. Snapshots + OOM rows both use CPP / DSQ / DSG codes:
+    #   c*   -> bluscriptCP      (cudaMemGetInfo peak)
+    #   dsq  -> DS-Qwen3         (torch reserved peak)
+    #   dsg  -> DS-GPT2          (torch reserved peak)
+    #   else -> DS-Ulysses       (fallback)
+    def canon_impl(x):
+        x = x.lower()
+        if x.startswith("c"):
+            return "bluscriptCP"
+        if x == "dsq":
+            return "DS-Qwen3"
+        if x == "dsg":
+            return "DS-GPT2"
+        return "DS-Ulysses"
     for r in records:
-        r["impl"] = "BluTrain" if r["impl"].lower().startswith("c") else "PyTorch"
+        r["impl"] = canon_impl(r["impl"])
 
     def sort_key(r):
         try:
@@ -143,11 +156,12 @@ def main():
 
     out_md = os.path.join(OUT_DIR, "mem_scaling_table.md")
     with open(out_md, "w") as f:
-        f.write("# Memory Scaling Results\n\n")
+        f.write("# Memory Scaling Results — bluscriptCP vs DeepSpeed-Ulysses Qwen3\n\n")
         f.write("`smi_max_used_mb` = max per-GPU MiB from live nvidia-smi "
-                "(includes CUDA context/NCCL), filtered to the run's GPUs. "
-                "`peak_mb` = each impl's native peak: PyTorch=torch max_reserved, "
-                "C++=cudaMemGetInfo used (see `peak_src`). Blank rows = OOM "
+                "(includes CUDA context/NCCL), filtered to the run's GPUs — the "
+                "apples-to-apples cross-impl metric. `peak_mb` = each impl's "
+                "native peak: bluscriptCP=cudaMemGetInfo used, "
+                "DS-Ulysses=torch max_reserved (see `peak_src`). Blank rows = OOM "
                 "(no snapshot produced).\n\n")
         f.write("| " + " | ".join(cols) + " |\n")
         f.write("|" + "|".join(["---"] * len(cols)) + "|\n")

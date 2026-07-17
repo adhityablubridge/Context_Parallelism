@@ -338,6 +338,31 @@ run-cp-ulysses: $(ULYSSES_EXE)
 	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
 	    mpirun -np $(NP) ./$(ULYSSES_EXE) $(ARGS)
 
+# =============================================================================
+# Hybrid 3-D CP (Ulysses-inner + Ring-outer) parity test (additive; new target).
+# The RING stage uses the fused-RoPE CP kernels, so this MUST be built with
+# CP_FUSED_ROPE=1 (like bluscriptCP ring mode). Needs >=4 ranks to be meaningful.
+# Build: make CP_FUSED_ROPE=1 cp-hybrid
+# Run:   make CP_FUSED_ROPE=1 run-cp-hybrid NP=4   (and NP=8)
+# =============================================================================
+HYBRID_SRC := Tests/cp_hybrid_parity.cpp
+HYBRID_OBJ := $(OBJDIR)/Tests/cp_hybrid_parity.o
+HYBRID_EXE := $(BINDIR)/cp_hybrid_parity_exec
+.PHONY: cp-hybrid run-cp-hybrid
+cp-hybrid: $(HYBRID_EXE)
+$(HYBRID_EXE): $(HYBRID_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) | $(TENSOR_LIB_A) $(PROFILER_LIB)
+	@mkdir -p $(BINDIR)
+	@echo -e "\n--- Linking Hybrid CP parity test (sm_$(SM_ARCH)): $@"
+	$(NVCC) $(LINKFLAGS) $(LDFLAGS) -o $@ \
+	        $(HYBRID_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) \
+	        -Xlinker --start-group $(TENSOR_LIB_A) -Xlinker --end-group \
+	        $(LDLIBS) $(LINK_MEMFLAGS)
+
+run-cp-hybrid: $(HYBRID_EXE)
+	@echo "--- Running Hybrid CP parity on $(NP) rank(s) ---"
+	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
+	    mpirun -np $(NP) ./$(HYBRID_EXE) $(ARGS)
+
 # Compile + run a single standalone .cpp against libtensor, then keep the binary
 # in $(BINDIR). Usage: make run-snippet FILE=path/to/file.cpp [NP=2]
 run-snippet: | $(TENSOR_LIB_A)

@@ -50,6 +50,20 @@
 #include "checkpointing/GradMode.h"
 #include "checkpointing/Checkpointing.h"       // CheckpointManager (save / load_latest)
 #include "device/CachingCudaAllocator.h"
+#include "dtype/DtypeTraits.h"                  // get_dtype_name() -- DTYPE_PROBE diagnostics only
+
+// ---------------------------------------------------------------------------
+// DTYPE_PROBE -- one-shot diagnostic prints added to answer: "what dtype is
+// actually flowing through the QKVO projections / CP attention / MLP at
+// runtime?" Each print site fires exactly once (function-local static, shared
+// across all layer instances) on rank 0 only, then goes silent. Purely
+// additive -- no behavior change. Remove freely once you have your answer.
+// ---------------------------------------------------------------------------
+static int mpi_rank_now() {
+    int r = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &r);
+    return r;
+}
 
 // Data + distributed
 #include "DataLoader.h"
@@ -127,12 +141,9 @@ struct ModelConfig {
 
     // ---- context parallel (env-resolved in main) ----
     int         cp_size    = 2;                          // sequence-parallel group size (CP_SIZE)
-    std::string attn_mode  = "ulysses";                     // "ring" | "ulysses" | "hybrid" (CP_ATTN_MODE)
+    std::string attn_mode  = "ulysses";                     // "ring" | "ulysses" (CP_ATTN_MODE)
     RotatorType rotator    = RotatorType::P2P;      // CP_ROTATOR
     bool        ring_mode  = true;                       // (attn_mode == "ring") -> HeadTail LB
-    // ---- hybrid 3-D CP (Ulysses-inner + Ring-outer); active when attn_mode=="hybrid" ----
-    int         ulysses_size = 1;                        // CP_ULYSSES_SIZE (inner all-to-all degree)
-    bool        hybrid_mode  = false;                    // (attn_mode == "hybrid")
 
     // ---- checkpointing ----
     bool        checkpointing = true;
@@ -190,11 +201,8 @@ public:
     ModelConfig cfg;
     std::shared_ptr<ContextParallel> cp_;
 
-    // cp_pg is the CP process group. In hybrid mode it is the RING sub-group and
-    // ulysses_pg carries the inner all-to-all; otherwise ulysses_pg is null.
     CausalGQA(const ModelConfig& c, DeviceIndex dev, const Tensor& cache, InitRng& rng,
-              const DeviceMesh& mesh, std::shared_ptr<ProcessGroupNCCL> cp_pg,
-              std::shared_ptr<ProcessGroupNCCL> ulysses_pg = nullptr)
+              const DeviceMesh& mesh, std::shared_ptr<ProcessGroupNCCL> cp_pg)
         : norm(c.d_model, c.rms_eps),
           wQ(c.d_model, c.q_heads  * c.head_dim, /*bias=*/false),
           wK(c.d_model, c.kv_heads * c.head_dim, /*bias=*/false),
@@ -208,6 +216,17 @@ public:
         init_linear(wK, 0.02f, rng);
         init_linear(wV, 0.02f, rng);
         init_linear(wO, 0.02f * resid_scale, rng);
+
+        { // DTYPE_PROBE: weight storage dtype, once, rank 0 only.
+            static bool once = false;
+            if (!once && mpi_rank_now() == 0) {
+                std::cout << "[DTYPE_PROBE] CausalGQA weights -> wQ=" << get_dtype_name(wQ.weight.dtype())
+                          << "  wK=" << get_dtype_name(wK.weight.dtype())
+                          << "  wV=" << get_dtype_name(wV.weight.dtype())
+                          << "  wO=" << get_dtype_name(wO.weight.dtype()) << std::endl;
+                once = true;
+            }
+        }
 
         auto gopts = TensorOptions().with_dtype(Dtype::Float32).with_device(dev);
         q_gamma = Tensor::full(Shape{{c.head_dim}}, gopts, 1.0f);
@@ -224,19 +243,13 @@ public:
         register_parameter(k_gamma);
 
         // ---- Context-parallel attention layer ----
-        // ring   => HeadTail load-balance (matches shard_sequence_pre_embed's perm);
-        // ulysses=> contiguous shard;
-        // hybrid => Ulysses-inner (ulysses_pg) nested in Ring-outer (cp_pg==ring pg),
-        //           HeadTail on the ring axis. RoPE/QK-norm/GQA applied INSIDE CP.
+        // ring => HeadTail load-balance (matches shard_sequence_pre_embed's perm);
+        // ulysses => contiguous shard. RoPE/QK-norm/GQA are applied INSIDE CP.
         const float attn_scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
-        const bool  lb = (c.ring_mode || c.hybrid_mode);
         cp_ = std::make_shared<ContextParallel>(
             mesh, cp_pg, attn_scale, /*is_causal=*/true, c.rotator,
-            /*load_balance=*/lb);
-        if (c.hybrid_mode) {
-            cp_->enable_hybrid(ulysses_pg, c.ulysses_size, cos_sin_cache,
-                               q_gamma, k_gamma, c.qk_eps);
-        } else if (c.ring_mode) {
+            /*load_balance=*/c.ring_mode);
+        if (c.ring_mode) {
             cp_->enable_rope(cos_sin_cache, q_gamma, k_gamma, c.qk_eps);
         } else {
             cp_->enable_ulysses_fused(cos_sin_cache, q_gamma, k_gamma, c.qk_eps,
@@ -254,6 +267,18 @@ public:
         Tensor k = wK.forward(h);                        // [B, Tl, Nkv*hd]
         Tensor v = wV.forward(h);                        // [B, Tl, Nkv*hd]
 
+        { // DTYPE_PROBE: what dtype is actually feeding attention, once, rank 0 only.
+            static bool once = false;
+            if (!once && mpi_rank_now() == 0) {
+                std::cout << "[DTYPE_PROBE] pre-attn -> x=" << get_dtype_name(x.dtype())
+                          << " h=" << get_dtype_name(h.dtype())
+                          << " q=" << get_dtype_name(q.dtype())
+                          << " k=" << get_dtype_name(k.dtype())
+                          << " v=" << get_dtype_name(v.dtype()) << std::endl;
+                once = true;
+            }
+        }
+
         // -> head-major [B, heads, T_local, hd]
         q = autograd::transpose(autograd::reshape(q, Shape{{B, Tl, cfg.q_heads,  cfg.head_dim}}), 1, 2);
         k = autograd::transpose(autograd::reshape(k, Shape{{B, Tl, cfg.kv_heads, cfg.head_dim}}), 1, 2);
@@ -264,9 +289,26 @@ public:
         // (output stays [B, Nq, T_local, hd], no all-gather).
         Tensor attn = cp_->forward_cp(q, k, v, /*unshard=*/false, /*pre_sharded=*/true);
 
+        { // DTYPE_PROBE: CP attention's actual output dtype, once, rank 0 only.
+            static bool once = false;
+            if (!once && mpi_rank_now() == 0) {
+                std::cout << "[DTYPE_PROBE] post-attn -> attn_out=" << get_dtype_name(attn.dtype()) << std::endl;
+                once = true;
+            }
+        }
+
         Tensor merged = autograd::reshape(autograd::transpose(attn, 1, 2),
                                           Shape{{B, Tl, cfg.q_heads * cfg.head_dim}});
         Tensor proj = wO.forward(merged);
+
+        { // DTYPE_PROBE: wO's output dtype, once, rank 0 only.
+            static bool once = false;
+            if (!once && mpi_rank_now() == 0) {
+                std::cout << "[DTYPE_PROBE] wO.forward -> proj=" << get_dtype_name(proj.dtype()) << std::endl;
+                once = true;
+            }
+        }
+
         return autograd::add(x, proj);                   // residual
     }
 };
@@ -299,6 +341,18 @@ public:
         Tensor gu  = gate_up.forward(h);
         Tensor act = autograd::swiglu(gu);
         Tensor out = down.forward(act);
+
+        { // DTYPE_PROBE: MLP dtype flow, once, rank 0 only.
+            static bool once = false;
+            if (!once && mpi_rank_now() == 0) {
+                std::cout << "[DTYPE_PROBE] MLP -> h=" << get_dtype_name(h.dtype())
+                          << " gu=" << get_dtype_name(gu.dtype())
+                          << " act=" << get_dtype_name(act.dtype())
+                          << " out=" << get_dtype_name(out.dtype()) << std::endl;
+                once = true;
+            }
+        }
+
         return autograd::add(x, out);
     }
 };
@@ -320,16 +374,11 @@ public:
     std::vector<std::shared_ptr<SwiGLUMLP>> mlp;
     nn::RMSNorm   norm_f;
     std::shared_ptr<nn::Linear> lm_head;
-    // CP sharding coordinate (over the CP mesh axis). In hybrid mode the CP axis
-    // is factored into (ring_rank_, ulysses_rank_); cp_size_/cp_rank_ hold the
-    // composite CP degree/coord and drive the non-hybrid single-axis sharder.
+    // CP sharding coordinate (over the CP mesh axis).
     int cp_size_, cp_rank_;
-    int ring_rank_, ulysses_rank_;
 
     GPT(const ModelConfig& c, DeviceIndex dev, const DeviceMesh& mesh,
         std::shared_ptr<ProcessGroupNCCL> cp_pg, int cp_size, int cp_rank,
-        std::shared_ptr<ProcessGroupNCCL> ulysses_pg = nullptr,
-        int ring_rank = 0, int ulysses_rank = 0,
         uint64_t seed = 1234)
         : cfg(c),
           init_rng_(seed),
@@ -337,15 +386,14 @@ public:
           cos_sin_cache(autograd::build_rope_cache(c.context_length, c.head_dim,
                                                    static_cast<float>(c.rope_theta), dev)),
           norm_f(c.d_model, c.rms_eps),
-          cp_size_(cp_size), cp_rank_(cp_rank),
-          ring_rank_(ring_rank), ulysses_rank_(ulysses_rank)
+          cp_size_(cp_size), cp_rank_(cp_rank)
     {
         init_embedding(wte, 0.02f, init_rng_);
         wte.to(dev);
         norm_f.to(dev);
 
         for (int i = 0; i < c.n_layers; ++i) {
-            auto a = std::make_shared<CausalGQA>(c, dev, cos_sin_cache, init_rng_, mesh, cp_pg, ulysses_pg);
+            auto a = std::make_shared<CausalGQA>(c, dev, cos_sin_cache, init_rng_, mesh, cp_pg);
             auto m = std::make_shared<SwiGLUMLP>(c, dev, init_rng_);
             attn.push_back(a);
             mlp.push_back(m);
@@ -368,33 +416,41 @@ public:
     // idx [B, T] (full, UInt16/Int) -> logits [B, T_local, vocab] on the CP shard.
     Tensor forward(const Tensor& idx) override {
         // Shard the sequence over the CP axis (HeadTail for ring, contiguous for
-        // ulysses, composed HeadTail-over-ring + contiguous-over-ulysses for
-        // hybrid). Targets are sharded with the SAME perm in the loss (main).
+        // ulysses). Targets are sharded with the SAME perm in the loss (main).
         Tensor empty_y;
-        ShardedInputs sh;
-        if (cfg.hybrid_mode) {
-            const int ring_size = cfg.cp_size / cfg.ulysses_size;
-            sh = shard_sequence_pre_embed_hybrid(
-                idx, empty_y, cfg.T, ring_size, ring_rank_,
-                cfg.ulysses_size, ulysses_rank_, idx.device());
-        } else {
-            sh = shard_sequence_pre_embed(
-                idx, empty_y, cfg.T, cp_size_, cp_rank_, /*load_balance=*/cfg.ring_mode,
-                idx.device());
-        }
+        ShardedInputs sh = shard_sequence_pre_embed(
+            idx, empty_y, cfg.T, cp_size_, cp_rank_, /*load_balance=*/cfg.ring_mode,
+            idx.device());
 
         Tensor x = wte.forward(sh.idx_local);            // [B, T_local, d_model] (NO wpe)
+
+        { // DTYPE_PROBE: embedding output dtype, once, rank 0 only.
+            static bool once = false;
+            if (!once && mpi_rank_now() == 0) {
+                std::cout << "[DTYPE_PROBE] wte.forward -> x=" << get_dtype_name(x.dtype()) << std::endl;
+                once = true;
+            }
+        }
+
         for (int i = 0; i < cfg.n_layers; ++i) {
             x = attn[i]->forward(x);
             x = mlp[i]->forward(x);
         }
         x = norm_f.forward(x);
 
-        if (cfg.weight_tying) {
-            Tensor w_t = autograd::transpose(wte.weight, 0, 1);   // [d_model, vocab]
-            return autograd::matmul(x, w_t);                      // [B, T_local, vocab]
+        Tensor logits = cfg.weight_tying
+            ? autograd::matmul(x, autograd::transpose(wte.weight, 0, 1))   // [B, T_local, vocab]
+            : lm_head->forward(x);
+
+        { // DTYPE_PROBE: final logits dtype, once, rank 0 only.
+            static bool once = false;
+            if (!once && mpi_rank_now() == 0) {
+                std::cout << "[DTYPE_PROBE] logits -> " << get_dtype_name(logits.dtype()) << std::endl;
+                once = true;
+            }
         }
-        return lm_head->forward(x);
+
+        return logits;
     }
 };
 
@@ -445,6 +501,17 @@ int main(int argc, char** argv) {
         std::cout << "=== Llama Context Parallel Training Script (bluscriptCP) ==="
                   << std::endl;
 
+    if (is_master) { // DTYPE_PROBE: build-time precision flags, so the console output
+                      // self-documents which attention path this binary can even reach.
+        std::cout << "[DTYPE_PROBE] built with CP_FUSED_ROPE="
+#if defined(CP_FUSED_ROPE)
+                  << "1 (ring-mode genuine-BF16 gqa_fused_rope_v2 kernel is compiled in)"
+#else
+                  << "0 (ring-mode fused kernel is a NO-OP stub -- CP_ATTN_MODE=ring will not use it)"
+#endif
+                  << std::endl;
+    }
+
     cudaSetDevice(rank);
     DeviceIndex device(Device::CUDA, rank);
 
@@ -453,17 +520,10 @@ int main(int argc, char** argv) {
     // ---- context-parallel topology from env ----
     cfg.cp_size = static_cast<int>(env_i64("CP_SIZE", world_size));  // default CP-only
     if (const char* m = std::getenv("CP_ATTN_MODE")) cfg.attn_mode = m;
-    cfg.ring_mode   = (cfg.attn_mode == "ring");
-    cfg.hybrid_mode = (cfg.attn_mode == "hybrid");
-    cfg.ulysses_size = static_cast<int>(env_i64("CP_ULYSSES_SIZE", 1));
-    if (is_master) {
-        if (cfg.hybrid_mode)
-            std::cout << "[CP attn mode] HYBRID (Ulysses-inner all-to-all + Ring-outer "
-                         "P2P); HeadTail load-balance on the ring axis\n";
-        else if (!cfg.ring_mode)
-            std::cout << "[CP attn mode] ULYSSES (all-to-all); load_balancing forced "
-                         "off (contiguous sharding)\n";
-    }
+    cfg.ring_mode = (cfg.attn_mode == "ring");
+    if (!cfg.ring_mode && is_master)
+        std::cout << "[CP attn mode] ULYSSES (all-to-all); load_balancing forced "
+                     "off (contiguous sharding)\n";
     std::string rotator_label = "p2p";
     if (const char* e = std::getenv("CP_ROTATOR")) {
         std::string rv = e;
@@ -471,10 +531,9 @@ int main(int argc, char** argv) {
         else if (rv == "allgather" || rv == "AllGather") { cfg.rotator = RotatorType::AllGather; rotator_label = "allgather"; }
         else                                             { cfg.rotator = RotatorType::AlltoAll; rotator_label = "alltoall"; }
     }
-    // Under pure Ulysses the ring rotator is unused (all-to-all attention); tag the
-    // snapshot with "ulysses" so it matches the sweep harness's filename. Hybrid
-    // DOES use the ring rotator (outer axis), so it keeps the rotator label.
-    if (!cfg.ring_mode && !cfg.hybrid_mode) rotator_label = "ulysses";
+    // Under Ulysses the ring rotator is unused (all-to-all attention); tag the
+    // snapshot with "ulysses" so it matches the sweep harness's filename.
+    if (!cfg.ring_mode) rotator_label = "ulysses";
 
     // ---- memory-occupancy probe (mirrors gpt2_cp_test.cpp) ----
     //   CP_MEM_PROBE=1     : run CP_MEM_PROBE_STEPS steps (grad_accum forced to 1),
@@ -486,19 +545,6 @@ int main(int argc, char** argv) {
     //   CP_MODEL_LABEL     : free-text label embedded in the snapshot (e.g. "48M").
     const bool mem_probe = std::getenv("CP_MEM_PROBE") != nullptr &&
                            std::atoi(std::getenv("CP_MEM_PROBE")) != 0;
-
-    // ---- long-context PPL-vs-position eval mode (additive, forward-only) ----
-    //   CP_EVAL_PPL=1  : load the checkpoint (CP_CKPT_RESUME=<run>), teacher-force
-    //                    over CP_EVAL_WINDOWS windows of length T from the given
-    //                    split, write pos,count,mean_nll,ppl to CP_EVAL_OUT, exit.
-    //                    Requires NP=1 / CP_SIZE=1 so T_local==T (positions are
-    //                    global -> no cross-rank NLL gather). Skips training,
-    //                    checkpoint saving, and training-log/config writes.
-    //   Build the base-vs-extended comparison by running it per checkpoint+YaRN:
-    //     base ckpt + YARN_SCALE=1              (naive extrapolation @ T)
-    //     extended ckpt + YARN_SCALE=4 ORIG=... (YaRN @ T)
-    const bool eval_ppl_mode = std::getenv("CP_EVAL_PPL") != nullptr &&
-                               std::atoi(std::getenv("CP_EVAL_PPL")) != 0;
     const int mem_probe_steps =
         std::getenv("CP_MEM_PROBE_STEPS") ? std::atoi(std::getenv("CP_MEM_PROBE_STEPS")) : 2;
     const std::string mem_label =
@@ -510,6 +556,13 @@ int main(int argc, char** argv) {
     cfg.q_heads   = env_i64("CP_N_HEAD",  cfg.q_heads);
     cfg.kv_heads  = env_i64("CP_N_KVHEAD", cfg.kv_heads);
     cfg.head_dim  = cfg.d_model / cfg.q_heads;
+    // SwiGLU inner dim tracks d_model (8/3 * d_model): recompute after any
+    // CP_N_EMBD override so wider models (e.g. 768 -> 2048) get the right ffn.
+    // Overridable via CP_FFN for non-standard widths.
+    cfg.ffn_hidden = env_i64("CP_FFN", (8 * cfg.d_model) / 3);
+    // Weight tying (share lm_head with wte): env-settable so scaling sweeps can
+    // reproduce tied configs (drops vocab*d_model params + their optimizer state).
+    if (const char* e = std::getenv("CP_WEIGHT_TYING")) cfg.weight_tying = (e[0] == '1');
     cfg.B            = env_i64("CP_B", cfg.B);
     cfg.global_batch = env_i64("CP_GLOBAL_BATCH", cfg.global_batch);
     cfg.max_steps    = static_cast<int>(env_i64("CP_MAX_STEPS", cfg.max_steps));
@@ -545,55 +598,7 @@ int main(int argc, char** argv) {
     const int dp_size = world_size / cp_size;
     if (cfg.T != cfg.context_length)
         die("T != context_length (RoPE cache is built at context_length)");
-    // Hybrid: CP_SIZE = ring_size * ulysses_size. ring_size is the OUTER (P2P
-    // rotation) degree, ulysses_size the INNER (all-to-all) degree.
-    int ring_size = cp_size;                 // non-hybrid: ring axis == whole CP
-    if (cfg.hybrid_mode) {
-        if (cfg.ulysses_size < 1)
-            die("CP_ULYSSES_SIZE must be >= 1");
-        if (cp_size % cfg.ulysses_size != 0)
-            die("CP_SIZE=" + std::to_string(cp_size) + " % CP_ULYSSES_SIZE=" +
-                std::to_string(cfg.ulysses_size) + " != 0");
-        ring_size = cp_size / cfg.ulysses_size;
-        // Ring HeadTail on the ring axis: T divisible by 2*ring_size.
-        if (cfg.T % (2 * ring_size) != 0)
-            die("T=" + std::to_string(cfg.T) + " not divisible by 2*ring_size=" +
-                std::to_string(2 * ring_size) + " (hybrid HeadTail)");
-        // Contiguous inner Ulysses slice of each ring block.
-        if ((cfg.T / ring_size) % cfg.ulysses_size != 0)
-            die("(T/ring_size)=" + std::to_string(cfg.T / ring_size) +
-                " not divisible by CP_ULYSSES_SIZE=" + std::to_string(cfg.ulysses_size) +
-                " (hybrid inner slice)");
-        // Fused-RoPE kernel tile: the HeadTail sub-chunk reaching the kernel is
-        // T/(2*ring_size); it MUST be a multiple of 32 or gqa_fused_rope_cp aborts.
-        if ((cfg.T / (2 * ring_size)) % 32 != 0)
-            die("T/(2*ring_size)=" + std::to_string(cfg.T / (2 * ring_size)) +
-                " not a multiple of 32 (fused-RoPE tile); increase CP_T so "
-                "T % (64*ring_size) == 0");
-        // Ulysses head split needs both q and kv heads divisible by U. The U>kv
-        // (kv-replication) path is NOT supported in hybrid v1.
-        if (cfg.q_heads % cfg.ulysses_size != 0)
-            die("q_heads=" + std::to_string(cfg.q_heads) +
-                " not divisible by CP_ULYSSES_SIZE=" + std::to_string(cfg.ulysses_size));
-        if (cfg.kv_heads % cfg.ulysses_size != 0)
-            die("kv_heads=" + std::to_string(cfg.kv_heads) +
-                " not divisible by CP_ULYSSES_SIZE=" + std::to_string(cfg.ulysses_size) +
-                " (hybrid does not yet support U > kv_heads replication)");
-        // Advisory fast-domain guard (perf, not correctness): warn if a Ulysses
-        // group would straddle a fast-interconnect island. F defaults to
-        // NO_GPUS_PER_NODE / cudaGetDeviceCount; set it to a NUMA/NVLink-island
-        // size to place Ulysses intra-island and Ring across it. NOT fatal.
-        int fast_domain = 0;
-        if (const char* e = std::getenv("NO_GPUS_PER_NODE")) fast_domain = std::atoi(e);
-        if (fast_domain <= 0) { int gc = 1; cudaGetDeviceCount(&gc); fast_domain = gc; }
-        if (fast_domain > 0 && (fast_domain % cfg.ulysses_size) != 0 && is_master)
-            std::cerr << "[CP WARN] fast-domain size (" << fast_domain
-                      << ") % CP_ULYSSES_SIZE (" << cfg.ulysses_size
-                      << ") != 0: a Ulysses group straddles a fast-interconnect "
-                         "boundary; the intra-node all-to-all may land on a slower "
-                         "link. This is a performance hint, not a correctness error."
-                      << std::endl;
-    } else if (cfg.ring_mode) {
+    if (cfg.ring_mode) {
         if (cfg.T % (2 * cp_size) != 0)
             die("T=" + std::to_string(cfg.T) + " not divisible by 2*CP_SIZE=" + std::to_string(2*cp_size) + " (HeadTail)");
     } else {
@@ -621,59 +626,16 @@ int main(int argc, char** argv) {
         die("global_batch not divisible by B*T*dp_size (" + std::to_string(tokens_per_micro) + ")");
     const int GRAD_ACCUM = static_cast<int>(cfg.global_batch / tokens_per_micro);
 
-    // ---- process groups: the mesh builds the WORLD PG (ncclCommSplit parent)
+    // ---- process groups: the 2-D mesh builds the WORLD PG (ncclCommSplit parent)
     // + per-axis sub-groups. Reuse the mesh's world PG for DataParallel — a second
-    // init_process_group would throw (BluTrain's PG registry is a singleton).
-    //   non-hybrid: 2-D {dp, cp}  -> cp_pg = axis 1.
-    //   hybrid (default, dp outer): 3-D {dp, ring, ulysses}. Ulysses is the fastest
-    //     axis (U consecutive ranks); RING stride = U; DP stride = ring*U. Good when
-    //     you want DP to cross the slow boundary (e.g. inter-node) and ring+ulysses
-    //     to stay on the fast domain.
-    //   hybrid + CP_RING_OUTER=1: 3-D {ring, dp, ulysses}. RING stride = dp*U so a
-    //     ring group spans across the coarse boundary while Ulysses AND DDP stay on
-    //     the fast domain. Use this to put the RING (P2P, overlaps) across NUMA/nodes
-    //     and keep the bulk all-to-all + all-reduce intra-domain. Grouping is by rank
-    //     index; rank r binds to GPU (r % gpus_per_node), so on one node the logical
-    //     groups land on physical GPUs in order. ----
-    const bool ring_outer =
-        cfg.hybrid_mode && std::getenv("CP_RING_OUTER") &&
-        std::getenv("CP_RING_OUTER")[0] == '1';
+    // init_process_group would throw (BluTrain's PG registry is a singleton). ----
     std::vector<int> ranks_vec(world_size);
     for (int i = 0; i < world_size; ++i) ranks_vec[i] = i;
-    // Axis indices into the mesh (depend on the chosen ordering).
-    int dp_axis = 0, ring_axis = 1, uly_axis = 2;
-    std::vector<int> mesh_shape;
-    if (!cfg.hybrid_mode) {
-        mesh_shape = {dp_size, cp_size};                    // {dp, cp}
-    } else if (ring_outer) {
-        mesh_shape = {ring_size, dp_size, cfg.ulysses_size}; // {ring, dp, ulysses}
-        ring_axis = 0; dp_axis = 1; uly_axis = 2;
-    } else {
-        mesh_shape = {dp_size, ring_size, cfg.ulysses_size}; // {dp, ring, ulysses}
-        dp_axis = 0; ring_axis = 1; uly_axis = 2;
-    }
-    DeviceMesh mesh(mesh_shape, ranks_vec);
-    std::shared_ptr<ProcessGroupNCCL> pg = mesh.world_pg();  // global (all ranks), for DDP
-    std::shared_ptr<ProcessGroupNCCL> cp_pg, ulysses_pg;
-    int cp_rank = 0, dp_rank = mesh.get_dim_rank(dp_axis);
-    int ring_rank = 0, ulysses_rank = 0;
-    if (cfg.hybrid_mode) {
-        cp_pg        = mesh.get_process_group(ring_axis);   // RING sub-group (ContextParallel pg_)
-        ulysses_pg   = mesh.get_process_group(uly_axis);    // Ulysses sub-group (inner all-to-all)
-        ring_rank    = mesh.get_dim_rank(ring_axis);
-        ulysses_rank = mesh.get_dim_rank(uly_axis);
-        cp_rank      = ring_rank * cfg.ulysses_size + ulysses_rank;  // composite CP coord
-        if (is_master)
-            std::cout << "[CP hybrid mesh] order="
-                      << (ring_outer ? "{ring,dp,ulysses} (RING outer -> crosses coarse boundary)"
-                                     : "{dp,ring,ulysses} (DP outer)")
-                      << "  ring=" << ring_size << " dp=" << dp_size
-                      << " ulysses=" << cfg.ulysses_size << std::endl;
-    } else {
-        cp_pg     = mesh.get_process_group(1);     // CP ring/ulysses sub-group
-        cp_rank   = mesh.get_dim_rank(1);
-        ring_rank = cp_rank;                        // whole CP axis is the ring axis
-    }
+    DeviceMesh mesh({dp_size, cp_size}, ranks_vec);      // axis 0 = DP, axis 1 = CP
+    std::shared_ptr<ProcessGroupNCCL> pg = mesh.world_pg();  // global (all dp*cp ranks), for DDP
+    auto cp_pg  = mesh.get_process_group(1);             // CP ring sub-group
+    const int cp_rank = mesh.get_dim_rank(1);
+    const int dp_rank = mesh.get_dim_rank(0);
 
     if (is_master) {
         std::cout << "================ Configuration (bluscriptCP) ================\n"
@@ -685,13 +647,9 @@ int main(int argc, char** argv) {
                   << "  vocab_size      : " << cfg.vocab_size << "  tying=" << cfg.weight_tying << "\n"
                   << "  B x T           : " << cfg.B << " x " << cfg.T << "\n"
                   << "  world_size      : " << world_size
-                  << "  (dp=" << dp_size << " x cp=" << cp_size
-                  << (cfg.hybrid_mode ? " [ring=" + std::to_string(ring_size) +
-                                        " x ulysses=" + std::to_string(cfg.ulysses_size) + "]"
-                                      : "")
-                  << ")\n"
+                  << "  (dp=" << dp_size << " x cp=" << cp_size << ")\n"
                   << "  CP_ATTN_MODE    : " << cfg.attn_mode
-                  << "  (load_balance=" << ((cfg.ring_mode || cfg.hybrid_mode) ? "HeadTail" : "contiguous") << ")\n"
+                  << "  (load_balance=" << (cfg.ring_mode ? "HeadTail" : "contiguous") << ")\n"
                   << "  global_batch    : " << cfg.global_batch << "  (grad_accum=" << GRAD_ACCUM << ")\n"
                   << "  max_lr/min_lr   : " << cfg.max_lr << " / " << cfg.min_lr << "\n"
                   << "  warmup/steps    : " << cfg.warmup_steps << " / " << cfg.max_steps << "\n"
@@ -701,8 +659,7 @@ int main(int argc, char** argv) {
     }
 
     if (is_master) std::cout << "Initializing model on CUDA device " << rank << "..." << std::endl;
-    GPT model(cfg, device, mesh, cp_pg, cp_size, cp_rank,
-              ulysses_pg, ring_rank, ulysses_rank, /*seed=*/1234);
+    GPT model(cfg, device, mesh, cp_pg, cp_size, cp_rank, /*seed=*/1234);
 
     auto params = model.parameters();
     int64_t num_params = 0;
@@ -811,7 +768,7 @@ int main(int argc, char** argv) {
                   << (ckpt_resuming ? " (resume run " : " (run ") << run_number << ")\n";
 
         config_filename = "CP_BluScreipt_Training_logs/CP_Training_log" + std::to_string(run_number) + "_config.txt";
-        std::ofstream config_file(eval_ppl_mode ? "/dev/null" : config_filename.c_str(),
+        std::ofstream config_file(config_filename,
                                   (ckpt_resuming && log_exists) ? std::ios::app : std::ios::out);
         if (ckpt_resuming && log_exists)
             config_file << "\n# resumed run " << run_number << " from step " << resume_top_step << "\n";
@@ -827,11 +784,8 @@ int main(int argc, char** argv) {
         config_file << "  B: " << cfg.B << "\n";
         config_file << "  T: " << cfg.T << "\n";
         config_file << "  world_size: " << world_size << "  (dp=" << dp_size << " x cp=" << cp_size << ")\n";
-        if (cfg.hybrid_mode)
-            config_file << "  hybrid: ring_size=" << ring_size
-                        << " ulysses_size=" << cfg.ulysses_size << "\n";
         config_file << "  CP_ATTN_MODE: " << cfg.attn_mode
-                    << "  (load_balance=" << ((cfg.ring_mode || cfg.hybrid_mode) ? "HeadTail" : "contiguous") << ")\n";
+                    << "  (load_balance=" << (cfg.ring_mode ? "HeadTail" : "contiguous") << ")\n";
         config_file << "  global_batch: " << cfg.global_batch << "\n";
         config_file << "  grad_accum_steps: " << GRAD_ACCUM << "\n";
         config_file << "  Parameters: " << num_params << "\n";
@@ -851,10 +805,8 @@ int main(int argc, char** argv) {
         config_file.close();
 
         // Resume -> append to the same run's CSV; fresh run -> truncate + header.
-        // Eval mode must not touch the training CSV -> write to /dev/null.
         const bool append_log = ckpt_resuming && log_exists;
-        log_file.open(eval_ppl_mode ? "/dev/null" : log_filename.c_str(),
-                      append_log ? std::ios::app : std::ios::out);
+        log_file.open(log_filename, append_log ? std::ios::app : std::ios::out);
         if (!log_file.is_open()) {
             std::cerr << "ERROR: Could not open log file " << log_filename << "\n";
             std::exit(1);
@@ -942,106 +894,6 @@ int main(int argc, char** argv) {
     // to produce gpt2_cp_test-style per-step [TIMING] breakdown lines.
     CudaTimer timer_step, timer_data, timer_fwd, timer_loss, timer_bwd, timer_clip, timer_optim;
 
-    // Shard the targets with the SAME perm GPT::forward applies to the inputs
-    // (single-axis for ring/ulysses, composed HeadTail-over-ring + contiguous-
-    // over-ulysses for hybrid).
-    auto shard_targets = [&](const Tensor& in, const Tensor& tgt) -> ShardedInputs {
-        if (cfg.hybrid_mode)
-            return shard_sequence_pre_embed_hybrid(
-                in, tgt, cfg.T, ring_size, ring_rank, cfg.ulysses_size, ulysses_rank, device);
-        return shard_sequence_pre_embed(
-            in, tgt, cfg.T, cp_size, cp_rank, cfg.ring_mode, device);
-    };
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Long-context PPL-vs-position eval (forward-only; exits before training).
-    // Requires cp_size==1 so model.forward returns full [B,T,vocab] and each
-    // position t maps directly to the global index (no cross-rank NLL gather).
-    // Teacher-forces CP_EVAL_WINDOWS contiguous windows of length T from the
-    // chosen split and accumulates per-position NLL; PPL(t) = exp(mean_nll(t)).
-    // ─────────────────────────────────────────────────────────────────────────
-    if (eval_ppl_mode) {
-        if (cp_size != 1)
-            throw std::runtime_error(
-                "CP_EVAL_PPL requires NP=1 / CP_SIZE=1 (per-position NLL is computed "
-                "without cross-rank gather).");
-
-        const int         n_windows = static_cast<int>(env_i64("CP_EVAL_WINDOWS", 10));
-        const std::string out_csv   = std::getenv("CP_EVAL_OUT")
-                                        ? std::getenv("CP_EVAL_OUT") : "ppl_vs_pos.csv";
-        const int     Tpos = static_cast<int>(cfg.T);
-        const int     Bloc = static_cast<int>(cfg.B);
-        const int64_t V    = cfg.vocab_size;
-
-        if (is_master)
-            std::cout << "[eval] PPL-vs-position: " << n_windows << " windows x B=" << Bloc
-                      << " T=" << Tpos << " (YARN_SCALE via env) -> " << out_csv << std::endl;
-
-        std::vector<double>    sum_nll(static_cast<size_t>(Tpos), 0.0);
-        std::vector<long long> cnt(static_cast<size_t>(Tpos), 0);
-
-        autograd::NoGradGuard no_grad;
-        val_loader.reset();
-        for (int w = 0; w < n_windows; ++w) {
-            Batch b = val_loader.next_batch();
-            ShardedInputs shy = shard_targets(b.input, b.target);   // cp_size==1 => full [B,T]
-            Tensor logits = model.forward(b.input);                 // [B,T,V]
-            // Logits: force fp32 host copy (attention returns fp32, but guard bf16).
-            Tensor logits_cpu = logits.as_type(Dtype::Float32).to_cpu();
-            const float* lp = logits_cpu.data<float>();
-
-            // Targets: y_local inherits the loader dtype (UInt16), NOT int64 --
-            // read it in its actual dtype or indexing walks off the buffer.
-            Tensor y_cpu = shy.y_local.to_cpu();                     // [B,T]
-            const Dtype ydt = y_cpu.dtype();
-            const uint16_t* yp16 = (ydt == Dtype::UInt16) ? y_cpu.data<uint16_t>() : nullptr;
-            const int32_t*  yp32 = (ydt == Dtype::Int32)  ? y_cpu.data<int32_t>()  : nullptr;
-            const int64_t*  yp64 = (ydt == Dtype::Int64)  ? y_cpu.data<int64_t>()  : nullptr;
-            if (!yp16 && !yp32 && !yp64)
-                throw std::runtime_error("CP_EVAL_PPL: unexpected target dtype for y_local");
-
-            // Per-position NLL[t] = logsumexp(logits[b,t]) - logits[b,t, target].
-            // Each position t is written by one iteration only (safe to OMP over t
-            // if -fopenmp is enabled; harmless no-op otherwise).
-            #pragma omp parallel for schedule(dynamic)
-            for (int t = 0; t < Tpos; ++t) {
-                for (int bi = 0; bi < Bloc; ++bi) {
-                    const size_t idx = static_cast<size_t>(bi) * Tpos + t;
-                    const float* row = lp + idx * V;
-                    float mx = row[0];
-                    for (int64_t v = 1; v < V; ++v) if (row[v] > mx) mx = row[v];
-                    double se = 0.0;
-                    for (int64_t v = 0; v < V; ++v) se += std::exp(static_cast<double>(row[v] - mx));
-                    const double lse = static_cast<double>(mx) + std::log(se);
-                    const int64_t tgt = yp16 ? static_cast<int64_t>(yp16[idx])
-                                       : yp64 ? yp64[idx]
-                                              : static_cast<int64_t>(yp32[idx]);
-                    if (tgt < 0 || tgt >= V) continue;              // skip padding/ignore ids
-                    sum_nll[static_cast<size_t>(t)] += lse - static_cast<double>(row[tgt]);
-                    cnt[static_cast<size_t>(t)]     += 1;
-                }
-            }
-            if (is_master)
-                std::cout << "[eval] window " << (w + 1) << "/" << n_windows << " done" << std::endl;
-        }
-
-        if (is_master) {
-            std::ofstream f(out_csv);
-            f << "pos,count,mean_nll,ppl\n";
-            f << std::fixed << std::setprecision(6);
-            for (int t = 0; t < Tpos; ++t) {
-                const double mn = cnt[static_cast<size_t>(t)] > 0
-                    ? sum_nll[static_cast<size_t>(t)] / static_cast<double>(cnt[static_cast<size_t>(t)])
-                    : 0.0;
-                f << t << "," << cnt[static_cast<size_t>(t)] << "," << mn << "," << std::exp(mn) << "\n";
-            }
-            std::cout << "[eval] wrote " << out_csv << " (" << Tpos << " positions, "
-                      << n_windows << " windows)" << std::endl;
-        }
-        MPI_Finalize();
-        return 0;
-    }
-
     if (is_master) std::cout << "\nStarting training...\n" << std::endl;
 
     for (int step = start_step; step < cfg.max_steps; ++step) {
@@ -1054,7 +906,8 @@ int main(int argc, char** argv) {
             float val_accum = 0.0f;
             for (int v = 0; v < cfg.val_loss_steps; ++v) {
                 Batch b = val_loader.next_batch();
-                ShardedInputs shy = shard_targets(b.input, b.target);
+                ShardedInputs shy = shard_sequence_pre_embed(
+                    b.input, b.target, cfg.T, cp_size, cp_rank, cfg.ring_mode, device);
                 Tensor logits = model.forward(b.input);            // [B, T_local, vocab]
                 Tensor loss = autograd::sparse_cross_entropy_loss(logits, shy.y_local);
                 val_accum += loss.to_cpu().data<float>()[0] / static_cast<float>(cfg.val_loss_steps);
@@ -1081,7 +934,8 @@ int main(int argc, char** argv) {
             timer_data.start_timer();
             Batch batch = train_loader.next_batch();
             // Shard targets with the SAME perm GPT::forward uses on the inputs.
-            ShardedInputs shy = shard_targets(batch.input, batch.target);
+            ShardedInputs shy = shard_sequence_pre_embed(
+                batch.input, batch.target, cfg.T, cp_size, cp_rank, cfg.ring_mode, device);
             time_data += timer_data.get_elapsed_seconds();
 
             timer_fwd.start_timer();

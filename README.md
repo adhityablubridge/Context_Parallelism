@@ -168,18 +168,43 @@ attention**, SwiGLU MLP, RMSNorm, tied lm_head. RoPE / QK-norm / GQA run **insid
 context-parallel layer (fused in the CP kernels), and it composes **CP with DataParallel** on the
 unified `ProcessGroupNCCL`.
 
-Two attention modes, selected by `CP_ATTN_MODE`:
+Three attention modes, selected by `CP_ATTN_MODE`:
 
 - **`ring`** (default) — RingAttention via the fused-RoPE CP kernels (GQA + HeadTail load-balance).
   **Requires building with `CP_FUSED_ROPE=1`.**
 - **`ulysses`** — DeepSpeed-style all-to-all sequence parallelism (GQA, contiguous shard). Works in
   the default build.
+- **`hybrid`** — 3-D **Ulysses-inner + Ring-outer** (Unified Sequence Parallelism: USP / LoongTrain).
+  Ulysses (all-to-all) runs on the **inner** axis (place it intra-node / on NVLink) nested inside a
+  Ring (P2P rotation) on the **outer** axis (place it inter-node). **Requires `CP_FUSED_ROPE=1`**
+  (the ring stage uses the fused kernel). `CP_ULYSSES_SIZE` sets the inner degree `U`; the ring
+  degree is `R = CP_SIZE / U`. v1 requires `q_heads % U == 0` **and** `kv_heads % U == 0`
+  (the `U > kv_heads` kv-replication layout is not yet supported).
 
 **Topology.** `CP_SIZE` (default = world size) sets the context-parallel group size;
 `dp_size = world_size / CP_SIZE`. So `CP_SIZE = world_size` is pure CP (sequence split across all
 ranks); a proper divisor gives 2-D **DP×CP** (data-parallel replicas each running a CP group). The
 sequence is split across the CP group; DataParallel replicates params and reduces gradients across
 all ranks. `world_size % CP_SIZE` must be 0.
+
+**Hybrid topology (3-D `{DP, Ring, Ulysses}`).** With `CP_ATTN_MODE=hybrid`, the CP group is
+factored `CP_SIZE = R × U` (`R = CP_SIZE / CP_ULYSSES_SIZE`), and the mesh is built
+`{dp_size, ring_size, ulysses_size}`. Grouping is purely by **rank index** (Ulysses is the fastest
+axis, so a Ulysses group is `U` consecutive ranks; Ring strides by `U`); correctness never depends
+on physical placement. Which axis lands on which interconnect is the **launcher's** job:
+
+- Use **node-major** rank placement so each Ulysses group sits on one node/NVLink island:
+  `mpirun --map-by ppr:${GPUS_PER_NODE}:node` (OpenMPI) or `srun --ntasks-per-node=${GPUS_PER_NODE}`
+  (SLURM). Ring then strides across nodes — Ulysses (bulk all-to-all) on the fast link, Ring (P2P,
+  overlaps with compute) across the slow link. This is the recommended USP/LoongTrain placement.
+- An **advisory** fast-domain guard warns (does not abort) if `NO_GPUS_PER_NODE % CP_ULYSSES_SIZE`
+  is nonzero. Set `NO_GPUS_PER_NODE` to a NUMA/NVLink-**island** size (smaller than a node) to place
+  Ulysses intra-island and run **Ring across NUMA** within a single node. It is a performance hint,
+  not a correctness constraint.
+
+Worked example — `DP=2, Ring=2, Ulysses=2` (8 ranks): `CP_SIZE=4`, `CP_ULYSSES_SIZE=2`,
+`dp_size = 8/4 = 2`. Ulysses groups are `{0,1},{2,3},{4,5},{6,7}` (co-locate each on one island);
+Ring groups stride by 2 (`{0,2},{1,3},…`); DP strides by 4.
 
 ### Build + run
 
@@ -193,6 +218,15 @@ CP_DATA_ROOT=/path/to/shards \
 make bluscript-cp
 CP_ATTN_MODE=ulysses CP_DATA_ROOT=/path/to/shards \
     make run-bluscript-cp NP=2
+
+# --- Hybrid (Ulysses-inner + Ring-outer). Needs CP_FUSED_ROPE=1 + node-major launch. ---
+# DP=2, Ring=2, Ulysses=2 on 8 ranks (2 nodes x 4 GPUs). CP_SIZE = R*U = 4.
+make CP_FUSED_ROPE=1 bluscript-cp
+CP_SIZE=4 CP_ULYSSES_SIZE=2 CP_ATTN_MODE=hybrid NO_GPUS_PER_NODE=4 \
+CP_DATA_ROOT=/path/to/shards \
+    make CP_FUSED_ROPE=1 run-bluscript-cp NP=8
+# (For explicit node-major placement, launch mpirun/srun directly with
+#  --map-by ppr:4:node / --ntasks-per-node=4; see Tests/hybrid_cp_smoke.sh.)
 ```
 
 `NP` = ranks/GPUs. **Env vars set before `make ... run-bluscript-cp` ARE forwarded to the ranks**
@@ -213,9 +247,12 @@ CP_ATTN_MODE=ulysses CP_DATA_ROOT=/path/to/shards \
 
 | Var | Default | Effect |
 |-----|---------|--------|
-| `CP_SIZE` | world size | CP group size. `= world_size` ⇒ CP-only; divisor ⇒ 2-D DP×CP. |
-| `CP_ATTN_MODE` | `ring` | `ring` (fused-RoPE ring; needs `CP_FUSED_ROPE=1` build) or `ulysses` (all-to-all). |
-| `CP_ROTATOR` | `alltoall` | Ring comm strategy: `p2p` / `alltoall` / `allgather`. |
+| `CP_SIZE` | world size | CP group size. `= world_size` ⇒ CP-only; divisor ⇒ 2-D DP×CP. In `hybrid`, `CP_SIZE = ring_size × ulysses_size`. |
+| `CP_ATTN_MODE` | `ring` | `ring` (fused-RoPE ring; needs `CP_FUSED_ROPE=1`), `ulysses` (all-to-all), or `hybrid` (Ulysses-inner + Ring-outer; needs `CP_FUSED_ROPE=1`). |
+| `CP_ULYSSES_SIZE` | `1` | **hybrid only** — inner Ulysses (all-to-all) degree `U`. Ring degree `R = CP_SIZE / U`. Requires `CP_SIZE % U == 0`, `q_heads % U == 0`, `kv_heads % U == 0`. |
+| `CP_RING_OUTER` | `0` | **hybrid only** — `1` builds the mesh `{ring, dp, ulysses}` (ring outermost) instead of the default `{dp, ring, ulysses}`. Makes the ring stride cross the coarse boundary so the **Ring** (P2P, overlaps) spans NUMA/nodes while **Ulysses AND DDP** stay on the fast domain. Use with DDP + ring-across-NUMA layouts. |
+| `CP_ROTATOR` | `alltoall` | Ring comm strategy: `p2p` / `alltoall` / `allgather` (used by `ring` and the outer axis of `hybrid`). |
+| `NO_GPUS_PER_NODE` | GPU count | Fast-domain (node / NUMA-island) size. In `hybrid`, an **advisory** guard warns if it is not a multiple of `CP_ULYSSES_SIZE`; also used for `cudaSetDevice` mapping. |
 
 **Model / data / optimization**
 
@@ -224,8 +261,8 @@ CP_ATTN_MODE=ulysses CP_DATA_ROOT=/path/to/shards \
 | `CP_N_EMBD` | 768 | `d_model`. |
 | `CP_N_LAYER` | 12 | Transformer blocks. |
 | `CP_N_HEAD` | 12 | Query heads. |
-| `CP_N_KVHEAD` | 4 | KV heads (GQA). `q_heads % kv_heads == 0`; `head_dim = d_model/q_heads` must be **64 or 128**. |
-| `CP_T` | 4096 | Sequence length (`== context_length`). Must be even; ring needs `T % (2·CP_SIZE) == 0`, ulysses `T % CP_SIZE == 0`. |
+| `CP_N_KVHEAD` | 4 | KV heads (GQA). `q_heads % kv_heads == 0`; `head_dim = d_model/q_heads` must be **64 or 128**. In `hybrid`, also `kv_heads % CP_ULYSSES_SIZE == 0`. |
+| `CP_T` | 4096 | Sequence length (`== context_length`). Must be even; ring needs `T % (2·CP_SIZE) == 0`, ulysses `T % CP_SIZE == 0`, hybrid `T % (2·ring_size) == 0`, `(T/ring_size) % ulysses_size == 0`, **and** the fused-RoPE tile `T/(2·ring_size) % 32 == 0` (i.e. `T % (64·ring_size) == 0`). |
 | `CP_B` | 8 | Micro-batch per rank. |
 | `CP_GLOBAL_BATCH` | 524288 | Tokens/step. Must be divisible by `B·T·dp_size`; `grad_accum = CP_GLOBAL_BATCH / (B·T·dp_size)`. |
 | `CP_MAX_STEPS` | 19073 | Training steps. |

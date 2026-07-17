@@ -4,6 +4,7 @@
 #include "autograd/operations/BinaryOps.h"
 #include "autograd/operations/ReshapeOps.h"
 #include "core/Tensor.h"
+#include "dtype/DtypeTraits.h"   // get_dtype_name() -- DTYPE_PROBE diagnostics only
 // #include "dnn/DistributedNN.h"
 #include "ops/IndexingOps.h"
 #include "ProcessGroupNCCL.h"   // canonical BluTrain PG (via -IBluTrain/dist/communication/include)
@@ -20,6 +21,7 @@
 #include "context_parallel/FusedRoPESDPA.h"   // sdpa_fused_forward_rope (gated by CP_FUSED_ROPE)
 #include "context_parallel/UlyssesAttention.h"        // Ulysses all-to-all layout transforms (additive)
 #include "context_parallel/UlyssesAttentionBackward.h" // Ulysses backward node (additive)
+#include "context_parallel/HybridUlyssesBackward.h"    // hybrid (Ulysses-inner) combine/partition backward nodes
 #include "context_parallel/UlyssesGQAAttentionBackward.h" // Ulysses GQA backward node (additive)
 #include "context_parallel/UlyssesFusedGQAAttentionBackward.h" // Ulysses fused RoPE+QKnorm+GQA node (additive)
 
@@ -177,6 +179,76 @@ inline ShardedInputs shard_sequence_pre_embed(
 }
 
 // ---------------------------------------------------------------------------
+// Hybrid 3-D sharding (Ulysses-inner + Ring-outer). Composes the ring HeadTail
+// zigzag (OUTER, over ring_size) with a contiguous Ulysses sub-slice (INNER,
+// over ulysses_size). Rank (ring_rank r, ulysses_rank u) loads
+// T/(ring_size*ulysses_size) tokens = contiguous piece u of ring block r's
+// [head_half_r | tail_half_r] buffer. After the inner ulysses_combine all-to-all
+// reassembles the U pieces in rank order, the ring sees the full T/ring_size
+// block in HeadTail layout -- exactly what compute_deltas(N=ring_size) expects.
+// Targets (y) use the IDENTICAL composed perm.
+//
+// Divisibility: T_full % (2*ring_size) == 0 (ring HeadTail) AND
+//               (T_full/ring_size) % ulysses_size == 0 (contiguous inner slice).
+// ---------------------------------------------------------------------------
+inline ShardedInputs shard_sequence_pre_embed_hybrid(
+    const Tensor &idx_full,
+    const Tensor &y_full,
+    int64_t T_full,
+    int ring_size,
+    int ring_rank,
+    int ulysses_size,
+    int ulysses_rank,
+    DeviceIndex device) {
+  const int64_t R = static_cast<int64_t>(ring_size);
+  const int64_t U = static_cast<int64_t>(ulysses_size);
+  if (T_full % (2 * R) != 0)
+    throw std::invalid_argument(
+        "shard_sequence_pre_embed_hybrid: T_full must be divisible by 2*ring_size (HeadTail)");
+  const int64_t T_ring = T_full / R; // tokens per ring block
+  if (T_ring % U != 0)
+    throw std::invalid_argument(
+        "shard_sequence_pre_embed_hybrid: (T_full/ring_size) must be divisible by ulysses_size");
+  const int64_t Tl = T_ring / U; // tokens per rank = T/(R*U)
+  const int64_t B = idx_full.shape().dims[0];
+
+  // 1. ring HeadTail perm for ring block `ring_rank` (length T_ring), [head|tail].
+  const int64_t chunk_sz = T_full / (2 * R);
+  const int64_t head_chunk = static_cast<int64_t>(ring_rank);
+  const int64_t tail_chunk = 2 * R - 1 - static_cast<int64_t>(ring_rank);
+  std::vector<int64_t> perm_ring(static_cast<size_t>(T_ring));
+  for (int64_t i = 0; i < chunk_sz; ++i) {
+    perm_ring[static_cast<size_t>(i)] = head_chunk * chunk_sz + i;
+    perm_ring[static_cast<size_t>(chunk_sz + i)] = tail_chunk * chunk_sz + i;
+  }
+  // 2. contiguous ulysses sub-slice: piece `ulysses_rank` of the ring block.
+  std::vector<int64_t> perm_local(static_cast<size_t>(Tl));
+  for (int64_t i = 0; i < Tl; ++i)
+    perm_local[static_cast<size_t>(i)] =
+        perm_ring[static_cast<size_t>(ulysses_rank) * Tl + i];
+
+  // pos_local: [1, Tl] int64 on device.
+  Tensor pos_cpu(Shape{{1, Tl}}, TensorOptions().with_dtype(Dtype::Int64));
+  std::memcpy(pos_cpu.data(), perm_local.data(),
+              static_cast<size_t>(Tl) * sizeof(int64_t));
+  ShardedInputs out;
+  out.pos_local = pos_cpu.to(device);
+
+  // idx_local / y_local via gather along axis 1 with the composed perm.
+  Tensor gidx_cpu(Shape{{B, Tl}}, TensorOptions().with_dtype(Dtype::Int64));
+  int64_t *gp = static_cast<int64_t *>(gidx_cpu.data());
+  for (int64_t b = 0; b < B; ++b)
+    std::memcpy(gp + b * Tl, perm_local.data(),
+                static_cast<size_t>(Tl) * sizeof(int64_t));
+  Tensor gather_idx = gidx_cpu.to(device);
+  out.idx_local = OwnTensor::gather(idx_full, /*dim=*/1, gather_idx);
+  if (y_full.is_valid())
+    out.y_local = OwnTensor::gather(y_full, /*dim=*/1, gather_idx);
+
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // ContextParallel : DModule
 //
 // Implements context parallelism (ring attention) as a distributed module.
@@ -264,6 +336,32 @@ public:
     use_ulysses_ = true; // route forward_cp -> forward_ulysses -> fused
   }
 
+  // Opt this CP layer into the 3-D HYBRID path (additive; Ulysses-inner nested in
+  // Ring-outer). This instance's own pg_ is the RING sub-group (size R); the
+  // Ulysses all-to-all runs over the separate ulysses_pg (size U). Attention flow:
+  //   seq-shard [B,H,T/(R*U),D]
+  //     --combine(ulysses_pg,U)-->  head-shard [B,H/U,T/R,D]
+  //     --ring forward_cp (pre_sharded, RoPE)-->  [B,H/U,T/R,D]
+  //     --partition(ulysses_pg,U)-->  seq-shard [B,H,T/(R*U),D]
+  // The ring stage IS a fused-RoPE ring, so this stores the same cache/gammas as
+  // enable_rope() and sets use_rope_. The caller MUST pre-shard the sequence over
+  // BOTH CP axes (shard_sequence_pre_embed_hybrid) and construct this instance
+  // with load_balance=true (HeadTail on the ring axis) and pg = ring sub-group.
+  void enable_hybrid(std::shared_ptr<ProcessGroupNCCL> ulysses_pg, int ulysses_size,
+                     const Tensor &cos_sin_cache, const Tensor &q_gamma,
+                     const Tensor &k_gamma, float eps = 1e-6f) {
+    // Ring stage = fused-RoPE ring: reuse the enable_rope() state exactly.
+    cos_sin_cache_ = cos_sin_cache;
+    q_gamma_ = q_gamma;
+    k_gamma_ = k_gamma;
+    rope_eps_ = eps;
+    use_rope_ = true;
+    // Inner Ulysses all-to-all group.
+    ulysses_pg_ = std::move(ulysses_pg);
+    ulysses_size_ = ulysses_size;
+    use_hybrid_ = true;
+  }
+
   // -----------------------------------------------------------------------
   // forward
   //
@@ -290,6 +388,13 @@ public:
     // entirely. The ring code below is left untouched for the default path.
     if (use_ulysses_)
       return forward_ulysses(q, k, v, unshard, pre_sharded);
+
+    // ----- Hybrid opt-in gate (Ulysses-inner + Ring-outer) -----
+    // forward_hybrid wraps the ring body (below) with the inner Ulysses
+    // all-to-all. It re-enters forward_cp with in_hybrid_ring_=true so the
+    // recursive call runs the RING body here instead of re-dispatching.
+    if (use_hybrid_ && !in_hybrid_ring_)
+      return forward_hybrid(q, k, v, unshard, pre_sharded);
 
     // ----- Phase 1: Context Parallel Shard -----
     // Shard Q along dim=2 (sequence dim in 4D [B, H, T, D])
@@ -1065,6 +1170,127 @@ private:
   // local head group, and an all-to-all back. See UlyssesAttention.h.
   // v1: MHA only, contiguous sharding (no HeadTail), blocking all-to-all.
   // -----------------------------------------------------------------------
+  // ---- Hybrid (Ulysses-inner + Ring-outer) helpers ----------------------
+
+  // ulysses_combine with autograd: the adjoint is ulysses_partition (pure
+  // permutation, no scaling). Mirrors the ring/ulysses grad-enable guard
+  // (requires_grad(), NoGrad-safe) so validation builds no graph.
+  Tensor combine_ag(const Tensor &x) {
+    Tensor out = OwnTensor::cp::ulysses_combine(ulysses_pg_, x, ulysses_size_);
+    if (x.requires_grad()) {
+      auto gf = std::make_shared<UlyssesCombineBackward>(ulysses_pg_, ulysses_size_);
+      Tensor &xm = const_cast<Tensor &>(x);
+      gf->set_next_edge(0, autograd::get_grad_edge(xm));
+      out.set_grad_fn(gf);
+      out.set_requires_grad(true);
+    }
+    return out;
+  }
+
+  // ulysses_partition with autograd: the adjoint is ulysses_combine.
+  Tensor partition_ag(const Tensor &x) {
+    Tensor out = OwnTensor::cp::ulysses_partition(ulysses_pg_, x, ulysses_size_);
+    if (x.requires_grad()) {
+      auto gf = std::make_shared<UlyssesPartitionBackward>(ulysses_pg_, ulysses_size_);
+      Tensor &xm = const_cast<Tensor &>(x);
+      gf->set_next_edge(0, autograd::get_grad_edge(xm));
+      out.set_grad_fn(gf);
+      out.set_requires_grad(true);
+    }
+    return out;
+  }
+
+  // Risk C isolated check (CP_SELFCHECK-gated): the inner all-to-all must be an
+  // exact inverse pair over ulysses_pg_. We check partition(combine(x)) == x
+  // (a round-trip identity). NOTE: this catches all-to-all axis/permute bugs but
+  // not a permutation that is consistently wrong in BOTH directions; the global
+  // [head|tail] reassembly-order invariant is validated end-to-end by the
+  // -np 8 hybrid parity test. Checked for q AND k/v because the KV path differs
+  // when U > kv_heads (a kv head is replicated across ulysses ranks).
+  void hybrid_selfcheck(const Tensor &x_local, const Tensor &xh, const char *tag) {
+    Tensor rt = OwnTensor::cp::ulysses_partition(ulysses_pg_, xh, ulysses_size_);
+    Tensor a = x_local.contiguous().to_cpu();
+    Tensor b = rt.to_cpu();
+    const float *pa = a.data<float>();
+    const float *pb = b.data<float>();
+    int64_t n = std::min<int64_t>(a.numel(), b.numel());
+    float md = 0.0f;
+    for (int64_t i = 0; i < n; ++i) md = std::max(md, std::abs(pa[i] - pb[i]));
+    if (md > 1e-5f)
+      std::cerr << "[CP_SELFCHECK hybrid] " << tag
+                << " combine/partition round-trip mismatch maxdiff=" << md
+                << " (ulysses_size=" << ulysses_size_ << ")" << std::endl;
+  }
+
+  // Turn the hybrid seq-sharded output into the caller's requested layout.
+  // unshard=false (TRAINING): return the local [B,H,T/(R*U),D] shard as-is.
+  // unshard=true  (inference/debug only, NoGrad): rebuild full [B,H,T,D]
+  //   INNER-FIRST -- gather over Ulysses (rank-order concat, NO de-zigzag; rebuilds
+  //   the full T/R ring block [head|tail]) THEN over Ring + unloadbalance de-zigzag.
+  //   Ring-first would hand unloadbalance a partial T/(R*U) slice it cannot
+  //   de-zigzag. Autograd through this gather is NOT supported (guarded below).
+  Tensor finalize_hybrid_output(Tensor &out_seq, bool unshard,
+                                const Tensor &grad_probe) {
+    if (!unshard)
+      return out_seq;
+    if (out_seq.requires_grad() || grad_probe.requires_grad())
+      throw std::runtime_error(
+          "ContextParallel hybrid: unshard=true is not supported under autograd "
+          "(training uses unshard=false). Wrap inference/validation in a "
+          "NoGradGuard.");
+    // 1. inner: rebuild the full T/R ring block from its U contiguous pieces.
+    Tensor ring_block =
+        OwnTensor::cp::ulysses_gather_seq(ulysses_pg_, out_seq, ulysses_size_);
+    // 2. outer: gather the R ring blocks (rank-order concat = HeadTail-zigzag
+    //    layout), then de-zigzag into global 0..T-1 order.
+    Tensor full =
+        OwnTensor::cp::ulysses_gather_seq(pg_, ring_block, world_size_);
+    if (load_balance_) {
+      load_balancer_.set_world_size(world_size_);
+      load_balancer_.unloadbalance(full);
+    }
+    return full;
+  }
+
+  // Full hybrid forward: inner Ulysses all-to-all -> outer Ring -> all-to-all back.
+  Tensor forward_hybrid(Tensor &q, Tensor &k, Tensor &v, bool unshard,
+                        bool pre_sharded) {
+    // Caller pre-shards the sequence over BOTH CP axes (the projections run on
+    // the [B,H,T/(R*U),D] local shard); pre_sharded is thus expected true here.
+    (void)pre_sharded;
+    // INNER all-to-all (ulysses_pg_): seq-shard -> head-shard.
+    Tensor qh = combine_ag(q); // [B,H/U,T/R,D]
+    Tensor kh = combine_ag(k);
+    Tensor vh = combine_ag(v);
+
+#ifndef NDEBUG
+    if (std::getenv("CP_SELFCHECK")) {
+      hybrid_selfcheck(q, qh, "q");
+      hybrid_selfcheck(k, kh, "k"); // covers U % kv == 0 replication
+      hybrid_selfcheck(v, vh, "v");
+    }
+#endif
+
+    // OUTER ring over pg_ (== ring sub-group). Re-enter forward_cp with the
+    // guard set so the RING body runs (not another hybrid dispatch). Always
+    // unshard=false / pre_sharded=true: the ring returns the local [B,H/U,T/R,D]
+    // shard; full unshard (if any) is handled by finalize_hybrid_output over
+    // both axes.
+    in_hybrid_ring_ = true;
+    Tensor oh;
+    try {
+      oh = forward_cp(qh, kh, vh, /*unshard=*/false, /*pre_sharded=*/true);
+    } catch (...) {
+      in_hybrid_ring_ = false;
+      throw;
+    }
+    in_hybrid_ring_ = false;
+
+    // INNER all-to-all back: head-shard -> seq-shard.
+    Tensor out = partition_ag(oh); // [B,H,T/(R*U),D]
+    return finalize_hybrid_output(out, unshard, q);
+  }
+
   Tensor forward_ulysses(Tensor &q, Tensor &k, Tensor &v, bool unshard,
                          bool pre_sharded) {
     // Fused RoPE+QK-norm+GQA dispatch (additive gate): when enabled, use the
@@ -1356,6 +1582,21 @@ private:
 
     Tensor out_g = out_bf.as_type(Dtype::Float32);       // [B, nq_local, T, hd]
 
+    { // DTYPE_PROBE: the bf16 attention leg (inside the fused kernel), once, rank 0.
+      // The C++-level probes straddle forward_cp and only see fp32 in/out; this
+      // one witnesses the actual bf16 pack/kernel-output/fp32-recast here.
+      static bool once = false;
+      if (!once && rank_ == 0) {
+        std::cout << "[DTYPE_PROBE] ulysses_fused attn -> qkv_in="
+                  << get_dtype_name(qg.dtype())
+                  << "  packed(kernel_in)=" << get_dtype_name(packed.dtype())
+                  << "  out_bf(kernel_out)=" << get_dtype_name(out_bf.dtype())
+                  << "  out_g(recast)=" << get_dtype_name(out_g.dtype())
+                  << std::endl;
+        once = true;
+      }
+    }
+
     // 5. partition Q-shaped output back; 6. optional plain unshard.
     Tensor out_l = cp::ulysses_partition(pg_, out_g, P); // [B, nq, Tl, D]
     Tensor output_tensor =
@@ -1426,6 +1667,15 @@ private:
   Tensor k_gamma_f_;
   float eps_f_ = 1e-6f;
   bool interleaved_f_ = false;
+
+  // Hybrid (Ulysses-inner + Ring-outer) opt-in (additive; default off). Set via
+  // enable_hybrid(). pg_ is the RING sub-group; ulysses_pg_ carries the inner
+  // all-to-all. in_hybrid_ring_ is a re-entrancy guard so the recursive ring
+  // forward_cp call bypasses the hybrid dispatch and runs the ring body.
+  bool use_hybrid_ = false;
+  std::shared_ptr<ProcessGroupNCCL> ulysses_pg_;
+  int ulysses_size_ = 1;
+  bool in_hybrid_ring_ = false;
 
   // Persistent forward ring buffers (see Phase 2). Reused across forward_cp
   // calls and reallocated only when the per-rank KV size changes, so the ring
