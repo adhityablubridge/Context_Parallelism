@@ -22,6 +22,7 @@ CP_Training_logs/
 CP_GPT2_Training_logs/
 CP_BluScreipt_Training_logs/
 mem_scaling_runs_bluscriptcp/
+mem_scaling_runs_hybrid/
 1step*.csv
 debug_rank_*.md
 
