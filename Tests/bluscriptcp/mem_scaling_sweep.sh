@@ -43,12 +43,12 @@ set -u  # (no -e: we WANT to continue after an OOM run fails)
 # Which GPUs to use. world_size = number of devices listed here.
 export CUDA_VISIBLE_DEVICES="0,1"
 
-# Implementations to run (1=yes, 0=no). They never run concurrently.
-RUN_CPP=1
-RUN_DS=1
+# Implementations to run (1=yes, 0=no). They never run concurrently. Env-overridable.
+RUN_CPP="${RUN_CPP:-1}"
+RUN_DS="${RUN_DS:-1}"
 
 # Build the C++ binary once before sweeping (1=yes). Set 0 if already built.
-BUILD_CPP=1
+BUILD_CPP="${BUILD_CPP:-1}"
 
 # Repo paths. This script sits in CP/Tests/bluscriptcp/, so REPO_ROOT is two up.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,8 +60,12 @@ DATA_ROOT="${CP_DATA_ROOT:-${REPO_ROOT}/Data_Loader/Data}"
 
 # DeepSpeed-Ulysses reference (separate repo). Override LF_ROOT if it moved.
 LF_ROOT="${LF_ROOT:-/home/blu-bridge25/LlamaFactory}"
-DS_PY_BIN="${LF_ROOT}/.venv/bin"                         # has `deepspeed` launcher
 DS_DIR="${LF_ROOT}/ds_ulysses"
+# Python interpreter that has DeepSpeed. Default is the LF venv, but that venv's
+# `python` can be a BROKEN symlink on a different machine (uv-managed venvs point
+# at a per-host interpreter path). Override DS_PYTHON with any interpreter that
+# can `import deepspeed`, e.g.  DS_PYTHON=/usr/bin/python3 ./mem_scaling_sweep.sh
+DS_PYTHON="${DS_PYTHON:-${LF_ROOT}/.venv/bin/python}"
 
 # WHICH DeepSpeed reference(s) to sweep alongside bluscriptCP:
 #   qwen3  -> qwen3_ds_ulysses.py  (d384/L6/qh6/kvh2 -- the bluscriptCP match)
@@ -80,10 +84,10 @@ T_START=2048
 T_MAX=262144
 
 # Fine-grained boundary search after the coarse doubling finds [last_OK, OOM].
-# Default OFF: the DS probe runs are real (slow) training launches. Enable for a
-# C++-only sweep (RUN_DS=0) to pin the exact max-T cutoff.
-FINE_GRAINED=0
-FINE_STEP=256
+# Default OFF: the DS probe runs are real (slow) training launches. Enable to pin
+# the exact max-T cutoff. Env-overridable, e.g. FINE_GRAINED=1 ./mem_scaling_sweep.sh
+FINE_GRAINED="${FINE_GRAINED:-0}"
+FINE_STEP="${FINE_STEP:-256}"
 
 # Per-run wall-clock timeout (seconds). Kills a hung run and treats it as fail.
 RUN_TIMEOUT=1200
@@ -171,8 +175,12 @@ ds_script_for() { case "$1" in DSQ) echo "${DS_DIR}/qwen3_ds_ulysses.py";;
                                DSG) echo "${DS_DIR}/gpt2_ds_ulysses.py";; esac; }
 
 if [[ "$RUN_DS" == "1" ]]; then
-  if [[ ! -x "${DS_PY_BIN}/deepspeed" ]]; then
-    echo "[DS] ERROR: ${DS_PY_BIN}/deepspeed not found. Disabling DS runs."; RUN_DS=0
+  # One test covers everything: can this interpreter import deepspeed? (A broken
+  # symlink or a missing module both fail here, with a clear message.)
+  if ! "$DS_PYTHON" -c "import deepspeed" 2>/dev/null; then
+    echo "[DS] ERROR: '$DS_PYTHON' cannot 'import deepspeed'"
+    echo "     (broken/missing interpreter or deepspeed not installed there)."
+    echo "     Set DS_PYTHON=/path/to/python-with-deepspeed and re-run. Disabling DS."; RUN_DS=0
   elif [[ ! -d "$DATA_ROOT" ]]; then
     echo "[DS] ERROR: DATA_ROOT $DATA_ROOT not found. Disabling DS runs."; RUN_DS=0
   else
@@ -269,9 +277,15 @@ run_one_ds() {  # impl_code(DSQ|DSG) label d l qh kvh ffn ty T
   local gbt=$(( B * T ))
   (
     cd "$LF_ROOT" || exit 97
-    export PATH="${DS_PY_BIN}:$PATH"
+    export PATH="$(dirname "$DS_PYTHON"):$PATH"
+    # Launch DeepSpeed via the chosen PYTHON + the launcher MODULE, not the bare
+    # `deepspeed` shim: on some boxes `deepspeed` resolves to a stale copy in
+    # ~/.local/bin whose shebang points at the wrong interpreter (missing the
+    # deepspeed module). `python -m deepspeed.launcher.runner` uses THIS
+    # interpreter's real DeepSpeed regardless of PATH/shim state.
     LF_CSV_LOG="$csv" \
-    timeout "$RUN_TIMEOUT" deepspeed --num_gpus "$WORLD_SIZE" "$script" \
+    timeout "$RUN_TIMEOUT" "$DS_PYTHON" -m deepspeed.launcher.runner \
+      --num_gpus "$WORLD_SIZE" "$script" \
       --data_root "$DATA_ROOT" --block_size "$T" --micro_batch_size "$B" \
       --global_batch_tokens "$gbt" --max_steps "$PROBE_STEPS" --warmup_steps 1 \
       --logging_steps 1 "${model_args[@]}" $DS_EXTRA_ARGS
@@ -361,9 +375,18 @@ sweep_impl() {  # impl
   done
 }
 
-[[ "$RUN_CPP" == "1" ]] && sweep_impl "CPP"
-if [[ "$RUN_DS" == "1" ]]; then
-  for _m in "${DS_IMPLS[@]}"; do sweep_impl "$_m"; done
+# Run order: RUN_ORDER=cpp_first (default) or ds_first. Override per-run, e.g.
+#   RUN_ORDER=ds_first ./mem_scaling_sweep.sh
+RUN_ORDER="${RUN_ORDER:-cpp_first}"
+run_cpp_block() { [[ "$RUN_CPP" == "1" ]] && sweep_impl "CPP"; }
+run_ds_block()  { [[ "$RUN_DS"  == "1" ]] && { for _m in "${DS_IMPLS[@]}"; do sweep_impl "$_m"; done; }; }
+
+if [[ "$RUN_ORDER" == "ds_first" ]]; then
+  run_ds_block
+  run_cpp_block
+else
+  run_cpp_block
+  run_ds_block
 fi
 
 echo ""

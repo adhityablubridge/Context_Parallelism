@@ -1,0 +1,40 @@
+=== Llama Context Parallel Training Script (bluscriptCP) ===
+[CP attn mode] HYBRID (Ulysses-inner all-to-all + Ring-outer P2P); HeadTail load-balance on the ring axis
+[CP hybrid mesh] order={dp,ring,ulysses} (DP outer)  ring=2 dp=1 ulysses=1
+================ Configuration (bluscriptCP) ================
+  d_model/layers  : 384 / 6
+  q/kv heads      : 6 / 2  (G=3, hd=64)
+  ffn_hidden      : 1024 (SwiGLU)
+  context_length  : 2048
+  vocab_size      : 50304  tying=0
+  B x T           : 2 x 2048
+  world_size      : 2  (dp=1 x cp=2 [ring=2 x ulysses=1])
+  CP_ATTN_MODE    : hybrid  (load_balance=HeadTail)
+  global_batch    : 4096  (grad_accum=1)
+  max_lr/min_lr   : 0.0006 / 6e-05
+  warmup/steps    : 1 / 2
+  checkpointing   : false  (ckpt_freq=50, dir=checkpoints_bluscriptcp)
+=============================================================
+Initializing model on CUDA device 0...
+[YaRN] build_rope_cache: seq_len=2048 hd=64 scale=1.000 low=3 high=13 m=1.0000
+Parameters: 48076416
+Parameters per GPU: 48076416
+max_steps: 2
+warmup_steps: 1
+found 15 shards for split train
+found 1 shards for split val
+Saving logs to: CP_BluScreipt_Training_logs/CP_Training_log29.csv (run 29)
+Checkpointing: OFF
+
+Starting training...
+
+[CP ring P2P] OVERLAP: dedicated non-blocking stream
+[CP bwd] overlap=ON
+step     0 | loss: 10.930821 | lr 6.0000e-04 | norm: 9.2482 | dt: 410.18ms | tok/sec: 9985.9 | mem: 5166MB | Time Left: 00 hrs : 00 mins
+  [TIMING] data: 1.3ms | fwd: 178.8ms | loss: 2.7ms | bwd: 208.9ms | clip: 2.6ms | optim: 6.6ms
+step     1 | loss: 10.655354 | lr 6.0000e-04 | norm: 11.2625 | dt: 257.98ms | tok/sec: 15877.5 | mem: 6094MB | Time Left: 00 hrs : 00 mins
+  [TIMING] data: 0.0ms | fwd: 66.8ms | loss: 1.2ms | bwd: 181.3ms | clip: 2.4ms | optim: 5.3ms
+[MEM_PROBE rank=0] tag=CPP_48M_r2u1_p2p_T2048_ws2 used_mb=6094.2
+[MEM_PROBE] wrote snapshot /home/blu-bridge25/CP/Tests/bluscriptcp/mem_scaling_runs_hybrid/CPP_48M_r2u1_p2p_T2048_ws2.txt
+
+=== Training complete ===

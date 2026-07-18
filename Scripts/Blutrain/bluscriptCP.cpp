@@ -510,6 +510,11 @@ int main(int argc, char** argv) {
     cfg.q_heads   = env_i64("CP_N_HEAD",  cfg.q_heads);
     cfg.kv_heads  = env_i64("CP_N_KVHEAD", cfg.kv_heads);
     cfg.head_dim  = cfg.d_model / cfg.q_heads;
+    // SwiGLU inner dim: honor CP_FFN, else scale with d_model (8/3*d_model). Was
+    // previously frozen at the d=384 default (1024) regardless of CP_N_EMBD, which
+    // silently undersized the FFN for any wider model in the scaling sweeps.
+    cfg.ffn_hidden = env_i64("CP_FFN", (8 * cfg.d_model) / 3);
+    if (const char* e = std::getenv("CP_WEIGHT_TYING")) cfg.weight_tying = (e[0] == '1');
     cfg.B            = env_i64("CP_B", cfg.B);
     cfg.global_batch = env_i64("CP_GLOBAL_BATCH", cfg.global_batch);
     cfg.max_steps    = static_cast<int>(env_i64("CP_MAX_STEPS", cfg.max_steps));
@@ -736,7 +741,7 @@ int main(int argc, char** argv) {
 
     // ---- data: shard the BATCH over the DP axis; all CP ranks in a group share it ----
     const std::string data_root = std::getenv("CP_DATA_ROOT")
-        ? std::getenv("CP_DATA_ROOT") : "/home/blu-bridge25/CP/Data_Loader/Data";
+        ? std::getenv("CP_DATA_ROOT") : "Data_Loader/Data";
     DataLoaderLite train_loader(static_cast<int>(cfg.B), static_cast<int>(cfg.T),
                                 dp_rank, dp_size, "train", data_root, is_master, 100000000, rank);
     DataLoaderLite val_loader(static_cast<int>(cfg.B), static_cast<int>(cfg.T),
