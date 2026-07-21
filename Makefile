@@ -290,6 +290,35 @@ run-cp-rope-fused: $(FUSED_EXE)
 	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
 	    ./$(FUSED_EXE) $(ARGS)
 
+# ---- CREAM position-label generators: pure-CPU unit test (no CUDA / no MPI). ----
+# Build & run: make cream-positions
+.PHONY: cream-positions
+cream-positions:
+	@echo "--- Building + running CREAM position unit test (CPU) ---"
+	@mkdir -p $(BINDIR)
+	$(CXX) -std=c++17 -I. Tests/cream_positions_test.cpp -o $(BINDIR)/cream_positions_test
+	./$(BINDIR)/cream_positions_test
+
+# ---- CREAM cache-gather parity (single GPU; needs CP_FUSED_ROPE=1). -------------
+# Build: make CP_FUSED_ROPE=1 cream-cache-parity   Run: make run-cream-cache-parity
+CREAM_SRC := Tests/cream_cache_gather_parity.cpp
+CREAM_OBJ := $(OBJDIR)/Tests/cream_cache_gather_parity.o
+CREAM_EXE := $(BINDIR)/cream_cache_gather_parity_exec
+.PHONY: cream-cache-parity run-cream-cache-parity
+cream-cache-parity: $(CREAM_EXE)
+$(CREAM_EXE): $(CREAM_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) | $(TENSOR_LIB_A) $(PROFILER_LIB)
+	@mkdir -p $(BINDIR)
+	@echo -e "\n--- Linking CREAM cache-gather parity test (sm_$(SM_ARCH)): $@"
+	$(NVCC) $(LINKFLAGS) $(LDFLAGS) -o $@ \
+	        $(CREAM_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) \
+	        -Xlinker --start-group $(TENSOR_LIB_A) -Xlinker --end-group \
+	        $(LDLIBS) $(LINK_MEMFLAGS)
+
+run-cream-cache-parity: $(CREAM_EXE)
+	@echo "--- Running CREAM cache-gather parity (single GPU) ---"
+	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
+	    ./$(CREAM_EXE) $(ARGS)
+
 # ---- bluscriptCP: context-parallel Llama training (DataParallel + ContextParallel
 #      on the unified PG). Ring path needs CP_FUSED_ROPE=1.
 # Build: make CP_FUSED_ROPE=1 bluscript-cp    Run: make CP_FUSED_ROPE=1 run-bluscript-cp NP=2

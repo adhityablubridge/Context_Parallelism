@@ -62,6 +62,8 @@
 // Context parallelism
 #include "process_group/device_mesh.h"          // DeviceMesh (canonical PG, ncclCommSplit)
 #include "context_parallel/ContextParallel.h"   // ContextParallel, shard_sequence_pre_embed, RotatorType
+#include "context_parallel/CreamPositions.h"     // CREAM/PoSE/RandPos position-label generators
+#include "ops/IndexingOps.h"                      // gather (cache-row select for CREAM)
 
 using namespace OwnTensor;
 
@@ -133,6 +135,16 @@ struct ModelConfig {
     // ---- hybrid 3-D CP (Ulysses-inner + Ring-outer); active when attn_mode=="hybrid" ----
     int         ulysses_size = 1;                        // CP_ULYSSES_SIZE (inner all-to-all degree)
     bool        hybrid_mode  = false;                    // (attn_mode == "hybrid")
+
+    // ---- CREAM context-extension position relabeling (additive; env-resolved) ----
+    // "off" (default) => byte-identical to prior behavior. "cream"|"pose"|"randpos"
+    // feed manipulated RoPE position LABELS via a gathered cos/sin cache. Single-GPU
+    // (CP_SIZE=1) only for now. factor(=YARN_SCALE) and scaled_max(=factor*T) derived.
+    std::string cream_mode      = "off";                 // CP_CREAM_MODE
+    double      cream_sigma     = 3.0;                    // CP_CREAM_SIGMA (truncated-Gaussian)
+    uint64_t    cream_seed      = 0;                      // CP_CREAM_SEED base (0 => step-derived)
+    int         cream_factor    = 0;                      // = YARN_SCALE (resolved in main)
+    int64_t     cream_scaled_max = 0;                     // = cream_factor * T (resolved in main)
 
     // ---- checkpointing ----
     bool        checkpointing = true;
@@ -316,6 +328,10 @@ private:
 public:
     nn::Embedding wte;
     Tensor        cos_sin_cache;
+    // ADDITIVE (CREAM): full YaRN-scaled cos/sin cache of length scaled_max, built
+    // ONLY when cream_mode != "off". Used solely as the gather SOURCE for per-step
+    // relabeled caches; never passed to the kernel directly. Invalid/empty when off.
+    Tensor        cream_full_cache_;
     std::vector<std::shared_ptr<CausalGQA>> attn;
     std::vector<std::shared_ptr<SwiGLUMLP>> mlp;
     nn::RMSNorm   norm_f;
@@ -343,6 +359,16 @@ public:
         init_embedding(wte, 0.02f, init_rng_);
         wte.to(dev);
         norm_f.to(dev);
+
+        // CREAM (additive): build the full YaRN-scaled cache (length scaled_max) as
+        // the gather source. build_rope_cache reads YARN_SCALE from env, so this row
+        // `pos` holds the YaRN-interpolated cos/sin for absolute position `pos`. Only
+        // built when CREAM is on; the base cos_sin_cache above is left untouched.
+        if (c.cream_mode != "off") {
+            cream_full_cache_ = autograd::build_rope_cache(
+                c.cream_scaled_max, c.head_dim,
+                static_cast<float>(c.rope_theta), dev);
+        }
 
         for (int i = 0; i < c.n_layers; ++i) {
             auto a = std::make_shared<CausalGQA>(c, dev, cos_sin_cache, init_rng_, mesh, cp_pg, ulysses_pg);
@@ -395,6 +421,55 @@ public:
             return autograd::matmul(x, w_t);                      // [B, T_local, vocab]
         }
         return lm_head->forward(x);
+    }
+
+    // CREAM (additive): generate manipulated RoPE position LABELS for this step and
+    // install a gathered cos/sin cache on EVERY CP layer. The gather is done ONCE
+    // here and fanned out to all layers -- do NOT move it inside a per-layer loop
+    // (it would cost n_layers x for nothing). No-op when cream_mode=="off"; call
+    // before forward() when CREAM is active. Single-GPU (CP_SIZE=1): local_idx==pos,
+    // so cream_cache[local_idx] rotates each token at its label L[local_idx].
+    void install_cream_positions(uint64_t seed) {
+        if (cfg.cream_mode == "off") return;
+        const int T = static_cast<int>(cfg.T);
+        const int factor = cfg.cream_factor;
+        std::vector<int64_t> L;
+        if (cfg.cream_mode == "cream")
+            L = OwnTensor::cp::cream::generate_cream_positions(T, factor, cfg.cream_sigma, seed);
+        else if (cfg.cream_mode == "pose")
+            L = OwnTensor::cp::cream::generate_pose_positions(T, factor, seed);
+        else if (cfg.cream_mode == "randpos")
+            L = OwnTensor::cp::cream::generate_randpos_positions(T, factor, seed);
+        else
+            throw std::runtime_error("unknown CP_CREAM_MODE: " + cfg.cream_mode);
+
+        // [T, hd] gather index: row i = L[i] broadcast across the hd columns so
+        // gather(dim=0) selects whole cache rows: out[i][j] = full_cache[L[i]][j].
+        const int64_t hd = cfg.head_dim;
+        Tensor idx_cpu(Shape{{static_cast<int64_t>(T), hd}},
+                       TensorOptions().with_dtype(Dtype::Int64));
+        int64_t* ip = static_cast<int64_t*>(idx_cpu.data());
+        for (int i = 0; i < T; ++i)
+            for (int64_t j = 0; j < hd; ++j)
+                ip[static_cast<int64_t>(i) * hd + j] = L[static_cast<size_t>(i)];
+        Tensor idx_dev = idx_cpu.to(cream_full_cache_.device());
+
+        Tensor cream_cache = OwnTensor::gather(cream_full_cache_, /*dim=*/0, idx_dev);
+        for (auto& a : attn) a->cp_->set_rope_cache(cream_cache);
+    }
+
+    // CREAM diagnostics: the middle-block START position sampled for a seed, so the
+    // training loop can log its distribution (verification step 4 -- confirm the
+    // truncated-Gaussian shape). head==tail, so head = the leading run [0,1,2,...];
+    // the middle block starts at the first label that breaks that run. -1 if not
+    // cream mode.
+    int64_t cream_middle_start(uint64_t seed) const {
+        if (cfg.cream_mode != "cream") return -1;
+        auto L = OwnTensor::cp::cream::generate_cream_positions(
+            static_cast<int>(cfg.T), cfg.cream_factor, cfg.cream_sigma, seed);
+        size_t head = 0;
+        while (head < L.size() && L[head] == static_cast<int64_t>(head)) ++head;
+        return (head < L.size()) ? L[head] : -1;
     }
 };
 
@@ -548,8 +623,46 @@ int main(int argc, char** argv) {
         die("world_size=" + std::to_string(world_size) + " % CP_SIZE=" + std::to_string(cfg.cp_size) + " != 0");
     const int cp_size = cfg.cp_size;
     const int dp_size = world_size / cp_size;
-    if (cfg.T != cfg.context_length)
-        die("T != context_length (RoPE cache is built at context_length)");
+
+    // ---- CREAM context-extension (additive; env-resolved; single-GPU only) ----
+    if (const char* e = std::getenv("CP_CREAM_MODE"))  cfg.cream_mode  = e;
+    if (const char* e = std::getenv("CP_CREAM_SIGMA")) cfg.cream_sigma = std::atof(e);
+    if (const char* e = std::getenv("CP_CREAM_SEED"))
+        cfg.cream_seed = static_cast<uint64_t>(std::strtoull(e, nullptr, 10));
+    const char* cream_log_path = std::getenv("CP_CREAM_LOG");  // optional dist-check CSV
+    const bool cream_on = (cfg.cream_mode != "off");
+    if (cream_on) {
+        // factor == YARN_SCALE (locked); scaled_max == factor * T. YaRN must be ON.
+        const double yarn_scale =
+            std::getenv("YARN_SCALE") ? std::atof(std::getenv("YARN_SCALE")) : 1.0;
+        cfg.cream_factor = static_cast<int>(yarn_scale + 0.5);
+        cfg.cream_scaled_max = static_cast<int64_t>(cfg.cream_factor) * cfg.T;
+        if (cfg.cream_mode != "cream" && cfg.cream_mode != "pose" &&
+            cfg.cream_mode != "randpos")
+            die("CP_CREAM_MODE must be off|cream|pose|randpos, got '" + cfg.cream_mode + "'");
+        if (cp_size != 1)
+            die("CREAM is single-GPU only for now: requires CP_SIZE=1 (got " +
+                std::to_string(cp_size) + ")");
+        if (yarn_scale <= 1.0)
+            die("CREAM requires YARN_SCALE > 1 (cache must be YaRN-scaled, got " +
+                std::to_string(yarn_scale) + ")");
+        if (cfg.cream_factor < 2)
+            die("CREAM requires integer YARN_SCALE >= 2 (got factor=" +
+                std::to_string(cfg.cream_factor) + ")");
+        if (cfg.cream_scaled_max % cfg.T != 0)
+            die("CREAM: scaled_max must be a multiple of T");
+        if (cfg.cream_scaled_max < cfg.T)
+            die("CREAM: scaled_max < T");
+    }
+
+    // The base RoPE cache is built at context_length. With CREAM the kernel-facing
+    // cache is a per-step gather of the full scaled cache, so T is legitimately
+    // decoupled from context_length -- but ONLY under CREAM. The original guard is
+    // preserved verbatim for the default (CREAM-off) path.
+    if (!cream_on) {
+        if (cfg.T != cfg.context_length)
+            die("T != context_length (RoPE cache is built at context_length)");
+    }
     // Hybrid: CP_SIZE = ring_size * ulysses_size. ring_size is the OUTER (P2P
     // rotation) degree, ulysses_size the INNER (all-to-all) degree.
     int ring_size = cp_size;                 // non-hybrid: ring axis == whole CP
@@ -987,6 +1100,10 @@ int main(int argc, char** argv) {
 
         autograd::NoGradGuard no_grad;
         val_loader.reset();
+        // CREAM (additive): install ONE fixed labeling for the whole eval so the
+        // per-physical-position NLL accumulation is consistent across windows. No-op
+        // when off (base cache is used, byte-identical to prior eval behavior).
+        if (cream_on) model.install_cream_positions(cfg.cream_seed);
         for (int w = 0; w < n_windows; ++w) {
             Batch b = val_loader.next_batch();
             ShardedInputs shy = shard_targets(b.input, b.target);   // cp_size==1 => full [B,T]
@@ -1078,6 +1195,19 @@ int main(int argc, char** argv) {
         double time_backward = 0, time_clip = 0, time_optim = 0;
         optimizer.zero_grad();
         loss_accum_gpu *= 0.0f;
+
+        // CREAM (additive): resample position labels once per optimizer step (shared
+        // across micro-batches) and install the gathered cache on all layers. No-op
+        // when off. Optional CP_CREAM_LOG=<csv> records the middle-block start per
+        // step for the truncated-Gaussian distribution sanity check.
+        if (cream_on) {
+            const uint64_t step_seed = cfg.cream_seed + static_cast<uint64_t>(step);
+            model.install_cream_positions(step_seed);
+            if (is_master && cream_log_path) {
+                std::ofstream cf(cream_log_path, std::ios::app);
+                cf << step << "," << model.cream_middle_start(step_seed) << "\n";
+            }
+        }
 
         // no_sync()/sync() gate ONLY DDP's param-grad hooks; the CP ring's cp_pg
         // comm runs every microstep (inside model.forward/backward) regardless.

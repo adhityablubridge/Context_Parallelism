@@ -306,6 +306,24 @@ public:
     use_rope_ = true;
   }
 
+  // ADDITIVE (CREAM): swap the resident RoPE cos/sin cache at runtime so the
+  // fused kernel indexes rows for manipulated position LABELS instead of the
+  // default 0..T-1 (see CreamPositions.h / the CREAM plan). Called ONLY when
+  // CREAM is active; when it is never called, cos_sin_cache_ keeps exactly the
+  // value enable_rope() gave it (default behavior is unchanged, byte-identical).
+  // cache_seq_len flows from the tensor's row count downstream, so no other
+  // state changes. The cache is a resident lookup table and MUST be gradient
+  // free end to end (built with with_req_grad(false)).
+  void set_rope_cache(const Tensor &cos_sin_cache) {
+    if (cos_sin_cache.requires_grad())
+      throw std::runtime_error(
+          "set_rope_cache: RoPE cache must be gradient-free (with_req_grad(false))");
+    cos_sin_cache_ = cos_sin_cache;
+    // Keep the fused-Ulysses cache in sync if that path is the one in use, so a
+    // single-GPU Ulysses config sees the same relabeled positions.
+    if (use_ulysses_fused_) cos_sin_cache_f_ = cos_sin_cache;
+  }
+
   // Opt this CP layer into the DeepSpeed-style ULYSSES attention path (additive).
   // When set, forward_cp dispatches to forward_ulysses (a single all-to-all layout
   // swap + one full-sequence causal SDPA + all-to-all back) instead of the ring.

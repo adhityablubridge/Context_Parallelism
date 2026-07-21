@@ -304,6 +304,29 @@ CP_DATA_ROOT=/path/to/shards \
 
    Model params are sequence-length- and world-size-independent (RoPE positions are computed, not learned), so the extended `CP_T` — and even a different world size — loads the same checkpoint; the RoPE cache is rebuilt from the YaRN env. Keep the architecture (`d_model` / heads / kv / layers / vocab) identical. Set `CP_MAX_STEPS` above the base-stage step (or pass `CP_CKPT_RESUME`) so the run is treated as incomplete — otherwise a completed run starts fresh instead of resuming.
 
+**CREAM position-relabeling context extension** (single-GPU / `CP_SIZE=1` only for now)
+
+CREAM (bigai-nlco/CREAM, *Continuity-Relativity indexing with Gaussian Middle*) extends the context window by **fine-tuning at the physical `CP_T` while feeding manipulated RoPE position labels** drawn from the larger `scaled_max = YARN_SCALE · CP_T` range: a head block `[0, head)`, a truncated-Gaussian-sampled contiguous middle block, and a tail block ending at `scaled_max`. The attention matrix stays `CP_T × CP_T` (memory cost unchanged) while the model learns rotations at large positions. It composes with YaRN: the cos/sin cache CREAM gathers from is built at `scaled_max` with YaRN active, so `YARN_SCALE > 1` is **required**.
+
+Mechanism (no CUDA change): at `CP_SIZE=1` the fused kernel indexes `cos_sin_cache[local_idx]`, so per step CREAM gathers the cache rows for its labels (`cache[L[j]]`) and installs that `[T, hd]` cache on every layer — see [context_parallel/CreamPositions.h](context_parallel/CreamPositions.h). `CP_CREAM_MODE=off` (default) is byte-identical to prior behavior.
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `CP_CREAM_MODE` | `off` | `off` / `cream` (Gaussian middle) / `pose` (2-chunk skip) / `randpos` (sorted random). Requires `CP_SIZE=1` and `YARN_SCALE > 1`. |
+| `CP_CREAM_SIGMA` | 3.0 | Truncated-Gaussian width for the middle-block sampling (`cream` only). |
+| `CP_CREAM_SEED` | 0 | Base seed; the per-step label seed is `CP_CREAM_SEED + step` (training) and the fixed `CP_CREAM_SEED` (eval). |
+| `CP_CREAM_LOG` | – | Optional CSV path; appends `step,middle_start` per step for the truncated-Gaussian distribution sanity check. |
+
+`factor` and `scaled_max` are **derived** (`factor = YARN_SCALE`, `scaled_max = factor · CP_T`) — there is no separate scaled-max knob, so they cannot drift. Startup asserts `YARN_SCALE > 1`, integer `factor ≥ 2`, and `scaled_max % CP_T == 0`. Note the v1 cache is shared across the batch (one labeling per step, resampled each step) and relabels the natural contiguous token chunk; per-row labels and multi-GPU CP need an explicit per-token position array in the kernel (deferred). Example:
+
+```bash
+CP_SIZE=1 CP_T=256 \
+CP_CREAM_MODE=cream CP_CREAM_SIGMA=3.0 CP_CREAM_LOG=cream_mid.csv \
+YARN_SCALE=8 YARN_ORIG_MAXPOS=256 \
+CP_CKPT_RESUME=<base_run> CP_MAX_STEPS=<target> CP_REWARMUP=<W> CP_REWARMUP_PEAK=0.3 \
+    make CP_FUSED_ROPE=1 run-bluscript-cp NP=1
+```
+
 **Diagnostics (ring) + device mapping**
 
 | Var | Effect |
