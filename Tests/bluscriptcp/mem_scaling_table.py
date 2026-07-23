@@ -74,7 +74,8 @@ def main():
     records = []
     for fn in sorted(os.listdir(OUT_DIR)):
         if fn.endswith(".txt") and (fn.startswith("CPP_") or
-                                    fn.startswith("DSQ_") or fn.startswith("DSG_")):
+                                    fn.startswith("DSQ_") or fn.startswith("DSG_") or
+                                    fn.startswith("LFQ_")):
             records.append(parse_snapshot(os.path.join(OUT_DIR, fn)))
 
     # Fold in OOM rows from results.csv (runs that produced no snapshot).
@@ -121,6 +122,7 @@ def main():
     #   c*   -> bluscriptCP      (cudaMemGetInfo peak)
     #   dsq  -> DS-Qwen3         (torch reserved peak)
     #   dsg  -> DS-GPT2          (torch reserved peak)
+    #   lfq  -> LF-Qwen3         (LlamaFactory v1 FSDP2+Ulysses, torch reserved peak)
     #   else -> DS-Ulysses       (fallback)
     def canon_impl(x):
         x = x.lower()
@@ -130,6 +132,8 @@ def main():
             return "DS-Qwen3"
         if x == "dsg":
             return "DS-GPT2"
+        if x == "lfq":
+            return "LF-Qwen3"
         return "DS-Ulysses"
     for r in records:
         r["impl"] = canon_impl(r["impl"])

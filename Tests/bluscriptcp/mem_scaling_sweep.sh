@@ -46,6 +46,10 @@ export CUDA_VISIBLE_DEVICES="0,1"
 # Implementations to run (1=yes, 0=no). They never run concurrently. Env-overridable.
 RUN_CPP="${RUN_CPP:-1}"
 RUN_DS="${RUN_DS:-1}"
+# LlamaFactory v1 trainer (FSDP2 + Ulysses) as a THIRD systems arm (the actual LF
+# framework, not the standalone DeepSpeed script). Off by default so the existing
+# CPP-vs-DS sweep is unchanged; set RUN_LF=1 to add the LF-Qwen3 rows.
+RUN_LF="${RUN_LF:-0}"
 
 # Build the C++ binary once before sweeping (1=yes). Set 0 if already built.
 BUILD_CPP="${BUILD_CPP:-1}"
@@ -75,6 +79,19 @@ DS_MODEL="${DS_MODEL:-qwen3}"
 
 # Extra args passed verbatim to the DS script (e.g. "--kv_heads 4" for wider CP).
 DS_EXTRA_ARGS="${DS_EXTRA_ARGS:-}"
+
+# ---- LlamaFactory v1 arm (RUN_LF=1) ----
+# The LF v1 trainer reads a fixed model dir (arch is baked in config.json), so the
+# LF arm only sweeps the config row whose arch matches LF_MODEL_DIR. Default is the
+# 48M dir; override both to benchmark the 114M config.
+LF_MODEL_DIR="${LF_MODEL_DIR:-${LF_ROOT}/qwen3_48m}"   # config-only dir (from-scratch init_on_meta)
+LF_LABEL="${LF_LABEL:-48M}"                            # CONFIGS row this arm runs (arch match)
+# Python/venv that has llamafactory + flash-attn (Ulysses patches flash-attn fwd).
+LF_PYTHON="${LF_PYTHON:-${LF_ROOT}/.venv/bin/python}"
+LF_CLI="${LF_CLI:-${LF_ROOT}/.venv/bin/llamafactory-cli}"
+# Helper that writes a throwaway fixed-length input_ids parquet at block=T (probe
+# data; systems metrics do not depend on token values).
+LF_PROBE_MK="${LF_ROOT}/scripts/make_probe_parquet.py"
 
 # Output: per-run snapshots + the results CSV.
 OUT_DIR="${SCRIPT_DIR}/mem_scaling_runs_bluscriptcp"
@@ -326,11 +343,111 @@ run_one_ds() {  # impl_code(DSQ|DSG) label d l qh kvh ffn ty T
   return 0
 }
 
+run_one_lf() {  # label d l qh kvh ffn ty T   (LlamaFactory v1 FSDP2+Ulysses, arch = LF_MODEL_DIR)
+  local label="$1" d="$2" l="$3" qh="$4" kvh="$5" ffn="$6" ty="$7" T="$8"
+  local tag="LFQ_${label}_ulysses_T${T}_ws${WORLD_SIZE}"
+  local snap="${OUT_DIR}/${tag}.txt" log="${LOG_DIR}/${tag}.log"
+  local csv="${LOG_DIR}/${tag}.csv" smi="${LOG_DIR}/${tag}.smi"
+  local ycfg="${LOG_DIR}/${tag}.yaml" dcfg="${LOG_DIR}/${tag}.dataset.yaml"
+  local pq="${LOG_DIR}/${tag}.parquet"
+  rm -f "$snap" "$csv"
+  echo "  -> [LFQ] LlamaFactory-v1 $label  T=$T  (cp_size=$WORLD_SIZE)"
+
+  # Throwaway probe data at block=T (systems metrics are value-independent).
+  if ! "$LF_PYTHON" "$LF_PROBE_MK" "$pq" --block "$T" \
+        --rows $(( B * PROBE_STEPS + 2 )) > "$log" 2>&1; then
+    echo "     FAIL: could not build probe parquet -- see $log"
+    echo "LFQ,${label},ulysses,${d},${l},${qh},${ty},${T},${WORLD_SIZE},OOM,${snap}" >> "$RESULTS_CSV"; return 1
+  fi
+  cat > "$dcfg" <<EOF
+probe_packed_${T}:
+  path: ${pq}
+  source: local
+  converter: pretrain_packed
+EOF
+  # grad_accum=1 at dp=1: global_batch_size = micro (=B); tokens/step = B*T (== DS arm).
+  cat > "$ycfg" <<EOF
+model: ${LF_MODEL_DIR}
+model_class: llm
+trust_remote_code: true
+flash_attn: flash_attention_2
+init_config:
+  name: init_on_meta
+custom_chat_template: "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+dist_config:
+  name: fsdp2
+  dcp_path: null
+  cp_mode: ulysses
+  cp_size: ${WORLD_SIZE}
+  mp_replicate_size: ${WORLD_SIZE}
+  mp_shard_size: 1
+train_dataset: ${dcfg}
+output_dir: ${LOG_DIR}/${tag}_out
+micro_batch_size: ${B}
+cutoff_len: ${T}
+global_batch_size: ${B}
+max_grad_norm: 1.0
+max_steps: ${PROBE_STEPS}
+bf16: true
+enable_activation_checkpointing: false
+seed: 42
+logging_steps: 1
+save_steps: 100000
+optim_config:
+  name: adamw
+  learning_rate: 6.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+lr_scheduler_config:
+  name: cosine_with_warmup
+  warmup_steps: 1
+  min_lr_ratio: 0.1
+EOF
+
+  (
+    cd "$LF_ROOT" || exit 97
+    USE_V1=1 FORCE_TORCHRUN=1 LF_CSV_LOG="$csv" \
+    timeout "$RUN_TIMEOUT" "$LF_CLI" train "$ycfg"
+  ) >> "$log" 2>&1 &
+  local lf_pid=$!
+  sample_smi_peak "$lf_pid" "$smi" &
+  local smi_pid=$!
+  wait "$lf_pid"; local rc=$?
+  wait "$smi_pid" 2>/dev/null
+
+  local smi_used="" ; [[ -s "$smi" ]] && smi_used="$(cat "$smi")"
+  # torch peak reserved = max mem_gpu_mb (last CSV column) over the probe rows.
+  local torch_peak=""
+  if [[ -s "$csv" ]]; then
+    torch_peak="$(awk -F',' 'NR>1 && $NF ~ /^[0-9.]+$/ {if($NF+0>m)m=$NF+0} END{if(m>0)printf "%.1f", m}' "$csv")"
+  fi
+
+  if [[ "$rc" != "0" ]] || [[ -z "$smi_used" && -z "$torch_peak" ]] || \
+     grep -qiE "out of memory|CUDA error|RuntimeError|torch.OutOfMemory" "$log"; then
+    echo "     FAIL/OOM (rc=$rc) -- see $log"
+    echo "LFQ,${label},ulysses,${d},${l},${qh},${ty},${T},${WORLD_SIZE},OOM,${snap}" >> "$RESULTS_CSV"
+    rm -f "$pq"; return 1
+  fi
+  {
+    echo "# MEM PROBE SNAPSHOT  tag=${tag}"
+    echo "# impl=LFQ label=${label} rotator=ulysses n_embd=${d} n_layer=${l} n_head=${qh} weight_tying=${ty}"
+    echo "# B=${B} T=${T} cp_world_size=${WORLD_SIZE} params="
+    [[ -n "$torch_peak" ]] && echo "# torch.peak_alloc_mb(rank0)= torch.peak_reserved_mb(rank0)=${torch_peak}"
+    echo "# SMI_USED_MB_PER_GPU=${smi_used}"
+    echo "# ---- llamafactory-v1 fsdp2+ulysses qwen3 (mem_gpu_mb=torch.max_memory_reserved; smi peak sampled) ----"
+  } > "$snap"
+  echo "     OK -- snapshot $snap (torch_peak=${torch_peak:-NA}MB smi peak: ${smi_used:-NA})"
+  echo "LFQ,${label},ulysses,${d},${l},${qh},${ty},${T},${WORLD_SIZE},OK,${snap}" >> "$RESULTS_CSV"
+  rm -f "$pq"; return 0
+}
+
 run_probe() {  # impl label d l qh kvh ffn ty T
   local impl="$1"
   case "$impl" in
     CPP)      run_one_cpp "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" ;;
     DSQ|DSG)  run_one_ds  "$impl" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" ;;
+    LFQ)      run_one_lf  "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" ;;
   esac
 }
 
@@ -342,6 +459,10 @@ sweep_impl() {  # impl
     read -r label d l qh kvh ffn ty <<< "$row"
     echo ""
     echo "==== $impl config $label (d_model=$d n_layer=$l q_heads=$qh kv_heads=$kvh ffn=$ffn tie=$ty) ===="
+    # LF arm reads a fixed model dir (arch baked in config.json) -> only its matching row.
+    if [[ "$impl" == "LFQ" && "$label" != "$LF_LABEL" ]]; then
+      echo "  (skip LFQ for $label: LF arm arch = $LF_LABEL / $LF_MODEL_DIR)"; continue
+    fi
     # Ulysses head-split feasibility: world_size must divide q_heads (and kv_heads
     # for the GQA impls: bluscriptCP + DSQ). DSG (GPT-2 MHA) only needs q_heads.
     local need_kv=1; [[ "$impl" == "DSG" ]] && need_kv=0
@@ -377,16 +498,32 @@ sweep_impl() {  # impl
 
 # Run order: RUN_ORDER=cpp_first (default) or ds_first. Override per-run, e.g.
 #   RUN_ORDER=ds_first ./mem_scaling_sweep.sh
+# LF preflight: needs a llamafactory-cli, an interpreter, the model dir, and the probe helper.
+if [[ "$RUN_LF" == "1" ]]; then
+  if [[ ! -x "$LF_CLI" ]] && ! command -v llamafactory-cli >/dev/null 2>&1; then
+    echo "[LF] ERROR: llamafactory-cli not found ($LF_CLI). Set LF_CLI=... Disabling LF."; RUN_LF=0
+  elif [[ ! -f "$LF_PROBE_MK" ]]; then
+    echo "[LF] ERROR: probe helper $LF_PROBE_MK missing. Disabling LF."; RUN_LF=0
+  elif [[ ! -d "$LF_MODEL_DIR" ]]; then
+    echo "[LF] ERROR: LF_MODEL_DIR $LF_MODEL_DIR not found. Disabling LF."; RUN_LF=0
+  fi
+  # Fall back to a PATH-resolved CLI if the venv path is absent but one is on PATH.
+  [[ ! -x "$LF_CLI" ]] && command -v llamafactory-cli >/dev/null 2>&1 && LF_CLI="$(command -v llamafactory-cli)"
+fi
+
 RUN_ORDER="${RUN_ORDER:-cpp_first}"
 run_cpp_block() { [[ "$RUN_CPP" == "1" ]] && sweep_impl "CPP"; }
 run_ds_block()  { [[ "$RUN_DS"  == "1" ]] && { for _m in "${DS_IMPLS[@]}"; do sweep_impl "$_m"; done; }; }
+run_lf_block()  { [[ "$RUN_LF"  == "1" ]] && sweep_impl "LFQ"; }
 
 if [[ "$RUN_ORDER" == "ds_first" ]]; then
   run_ds_block
+  run_lf_block
   run_cpp_block
 else
   run_cpp_block
   run_ds_block
+  run_lf_block
 fi
 
 echo ""

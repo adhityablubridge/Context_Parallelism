@@ -1072,6 +1072,60 @@ int main(int argc, char** argv) {
     };
 
     // ─────────────────────────────────────────────────────────────────────────
+    // CP_DUMP_NAMED: identity manifest for the ckpt2hf converter gate.
+    // Writes a value fingerprint of EACH weight read from its LIVE NAMED MEMBER
+    // (model.attn[i]->wK.weight, model.mlp[i]->gate_up.weight, ...), NOT by
+    // re-walking model.parameters()/the serialization order. The converter
+    // (scripts/convert_ckpt/ckpt2hf.py --verify-manifest) independently
+    // fingerprints each raw positional .ckpt slot under the same name and
+    // cross-checks, so the C++ ACTUAL parameter order is verified against the
+    // Python ASSUMED order -- this is the only check that catches a same-shape
+    // permutation (q/k_gamma, wK/wV, attn/mlp norm) that shape-validation can't.
+    // Requires the base checkpoint to be loaded (CP_CKPT_RESUME). Forward-only;
+    // exits after writing the manifest. Names are CP-native (layers.i.wK, ...) so
+    // they map 1:1 to positional slots on both sides.
+    // ─────────────────────────────────────────────────────────────────────────
+    if (const char* dump_path = std::getenv("CP_DUMP_NAMED")) {
+        auto write_fp = [](std::ostream& os, const Tensor& t) {
+            const Tensor c = t.as_type(Dtype::Float32).to_cpu();
+            const float* p = c.data<float>();
+            const size_t n = c.numel();
+            double sum = 0.0, sumsq = 0.0;
+            for (size_t i = 0; i < n; ++i) { const double v = p[i]; sum += v; sumsq += v * v; }
+            // Fields (must match the header): n,sum,sumsq,e_first,e_mid,e_last.
+            os << n << "," << std::setprecision(17)
+               << sum << "," << sumsq << ","
+               << (n ? static_cast<double>(p[0])       : 0.0) << ","
+               << (n ? static_cast<double>(p[n / 2])   : 0.0) << ","
+               << (n ? static_cast<double>(p[n - 1])   : 0.0);
+        };
+        if (is_master) {
+            std::ofstream mf(dump_path);
+            mf << "name,n,sum,sumsq,e_first,e_mid,e_last\n";
+            for (int i = 0; i < cfg.n_layers; ++i) {
+                const std::string pre = "layers." + std::to_string(i) + ".";
+                mf << pre << "q_gamma,";   write_fp(mf, model.attn[i]->q_gamma);      mf << "\n";
+                mf << pre << "k_gamma,";   write_fp(mf, model.attn[i]->k_gamma);      mf << "\n";
+                mf << pre << "attn_norm,"; write_fp(mf, model.attn[i]->norm.weight);  mf << "\n";
+                mf << pre << "wQ,";        write_fp(mf, model.attn[i]->wQ.weight);    mf << "\n";
+                mf << pre << "wK,";        write_fp(mf, model.attn[i]->wK.weight);    mf << "\n";
+                mf << pre << "wV,";        write_fp(mf, model.attn[i]->wV.weight);    mf << "\n";
+                mf << pre << "wO,";        write_fp(mf, model.attn[i]->wO.weight);    mf << "\n";
+                mf << pre << "mlp_norm,";  write_fp(mf, model.mlp[i]->norm.weight);   mf << "\n";
+                mf << pre << "gate_up,";   write_fp(mf, model.mlp[i]->gate_up.weight); mf << "\n";
+                mf << pre << "down,";      write_fp(mf, model.mlp[i]->down.weight);   mf << "\n";
+            }
+            mf << "wte,";    write_fp(mf, model.wte.weight);    mf << "\n";
+            mf << "norm_f,"; write_fp(mf, model.norm_f.weight); mf << "\n";
+            if (!cfg.weight_tying && model.lm_head) { mf << "lm_head,"; write_fp(mf, model.lm_head->weight); mf << "\n"; }
+            std::cout << "[dump-named] wrote identity manifest (live named members) -> "
+                      << dump_path << std::endl;
+        }
+        MPI_Finalize();
+        return 0;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Long-context PPL-vs-position eval (forward-only; exits before training).
     // Requires cp_size==1 so model.forward returns full [B,T,vocab] and each
     // position t maps directly to the global index (no cross-rank NLL gather).
@@ -1084,37 +1138,106 @@ int main(int argc, char** argv) {
                 "CP_EVAL_PPL requires NP=1 / CP_SIZE=1 (per-position NLL is computed "
                 "without cross-rank gather).");
 
-        const int         n_windows = static_cast<int>(env_i64("CP_EVAL_WINDOWS", 10));
+        int               n_windows = static_cast<int>(env_i64("CP_EVAL_WINDOWS", 10));
         const std::string out_csv   = std::getenv("CP_EVAL_OUT")
                                         ? std::getenv("CP_EVAL_OUT") : "ppl_vs_pos.csv";
         const int     Tpos = static_cast<int>(cfg.T);
         const int     Bloc = static_cast<int>(cfg.B);
         const int64_t V    = cfg.vocab_size;
 
+        // ─── Eval-faithfulness: optional shared token stream ────────────────────
+        // When CP_EVAL_TOKENS_BIN is set we bypass val_loader and window a raw
+        // int32 little-endian token file directly (input=toks[w*T .. w*T+T-1],
+        // target=toks[w*T+1 .. w*T+T]) with B forced to 1, so the exact same
+        // [pos] windows are scored here AND by the HF scorer (scripts/eval/
+        // ppl_vs_pos.py, which also uses B=1). This makes the CP-vs-HF PPL
+        // comparison read byte-identical token IDs. When UNSET, behavior below is
+        // byte-identical to the previous val_loader path (additive change).
+        const char*          tok_bin = std::getenv("CP_EVAL_TOKENS_BIN");
+        std::vector<int32_t> eval_toks;
+        const bool           bypass  = (tok_bin != nullptr);
+        if (bypass) {
+            std::ifstream tf(tok_bin, std::ios::binary | std::ios::ate);
+            if (!tf) throw std::runtime_error(std::string("CP_EVAL_TOKENS_BIN not readable: ") + tok_bin);
+            const std::streamsize nbytes = tf.tellg();
+            tf.seekg(0);
+            if (nbytes < 0 || (nbytes % 4) != 0)
+                throw std::runtime_error("CP_EVAL_TOKENS_BIN size not a multiple of 4 (expect int32 tokens)");
+            eval_toks.resize(static_cast<size_t>(nbytes) / 4);
+            tf.read(reinterpret_cast<char*>(eval_toks.data()), nbytes);
+            const long long max_w = (static_cast<long long>(eval_toks.size()) - 1) / Tpos;
+            if (max_w <= 0)
+                throw std::runtime_error("CP_EVAL_TOKENS_BIN too short for one window at T=CP_T");
+            if (n_windows > max_w) {
+                if (is_master)
+                    std::cout << "[eval] clamping windows " << n_windows << " -> " << max_w
+                              << " (stream has " << eval_toks.size() << " tokens at T=" << Tpos << ")\n";
+                n_windows = static_cast<int>(max_w);
+            }
+            if (is_master)
+                std::cout << "[eval] shared token stream: " << eval_toks.size() << " int32 tokens from "
+                          << tok_bin << " (B forced to 1 for HF-scorer parity)" << std::endl;
+        }
+
         if (is_master)
-            std::cout << "[eval] PPL-vs-position: " << n_windows << " windows x B=" << Bloc
-                      << " T=" << Tpos << " (YARN_SCALE via env) -> " << out_csv << std::endl;
+            std::cout << "[eval] PPL-vs-position: " << n_windows << " windows x B="
+                      << (bypass ? 1 : Bloc) << " T=" << Tpos << " (YARN_SCALE via env) -> "
+                      << out_csv << std::endl;
 
         std::vector<double>    sum_nll(static_cast<size_t>(Tpos), 0.0);
         std::vector<long long> cnt(static_cast<size_t>(Tpos), 0);
 
         autograd::NoGradGuard no_grad;
-        val_loader.reset();
+        if (!bypass) val_loader.reset();
         // CREAM (additive): install ONE fixed labeling for the whole eval so the
         // per-physical-position NLL accumulation is consistent across windows. No-op
         // when off (base cache is used, byte-identical to prior eval behavior).
         if (cream_on) model.install_cream_positions(cfg.cream_seed);
         for (int w = 0; w < n_windows; ++w) {
-            Batch b = val_loader.next_batch();
-            ShardedInputs shy = shard_targets(b.input, b.target);   // cp_size==1 => full [B,T]
-            Tensor logits = model.forward(b.input);                 // [B,T,V]
+            // Produce (input, y_local) either from the shared token stream (B=1)
+            // or from val_loader (B=cfg.B) — accumulation below uses the actual
+            // per-window batch size Bcur so both paths share the same NLL code.
+            Tensor input, y_local;
+            int    Bcur;
+            if (bypass) {
+                Bcur = 1;
+                std::vector<uint16_t> xh(static_cast<size_t>(Tpos)), yh(static_cast<size_t>(Tpos));
+                const size_t base = static_cast<size_t>(w) * static_cast<size_t>(Tpos);
+                for (int t = 0; t < Tpos; ++t) {
+                    const int32_t xi = eval_toks[base + t];
+                    const int32_t yi = eval_toks[base + t + 1];
+                    if (xi < 0 || xi >= V)
+                        throw std::runtime_error("CP_EVAL_TOKENS_BIN: input token out of [0,vocab)");
+                    if (yi < 0 || yi >= 65536)
+                        throw std::runtime_error("CP_EVAL_TOKENS_BIN: target token out of uint16 range");
+                    xh[static_cast<size_t>(t)] = static_cast<uint16_t>(xi);
+                    yh[static_cast<size_t>(t)] = static_cast<uint16_t>(yi);
+                }
+                input = Tensor(Shape{{1, static_cast<int64_t>(Tpos)}},
+                               TensorOptions().with_dtype(Dtype::UInt16).with_device(device));
+                Tensor tgt(Shape{{1, static_cast<int64_t>(Tpos)}},
+                           TensorOptions().with_dtype(Dtype::UInt16).with_device(device));
+                cudaMemcpy(input.data(), xh.data(), static_cast<size_t>(Tpos) * sizeof(uint16_t),
+                           cudaMemcpyHostToDevice);
+                cudaMemcpy(tgt.data(),   yh.data(), static_cast<size_t>(Tpos) * sizeof(uint16_t),
+                           cudaMemcpyHostToDevice);
+                ShardedInputs shy = shard_targets(input, tgt);      // cp_size==1 => no-op reshard
+                y_local = shy.y_local;
+            } else {
+                Batch b = val_loader.next_batch();
+                Bcur = Bloc;
+                input = b.input;
+                ShardedInputs shy = shard_targets(b.input, b.target);   // cp_size==1 => full [B,T]
+                y_local = shy.y_local;
+            }
+            Tensor logits = model.forward(input);                   // [Bcur,T,V]
             // Logits: force fp32 host copy (attention returns fp32, but guard bf16).
             Tensor logits_cpu = logits.as_type(Dtype::Float32).to_cpu();
             const float* lp = logits_cpu.data<float>();
 
             // Targets: y_local inherits the loader dtype (UInt16), NOT int64 --
             // read it in its actual dtype or indexing walks off the buffer.
-            Tensor y_cpu = shy.y_local.to_cpu();                     // [B,T]
+            Tensor y_cpu = y_local.to_cpu();                         // [Bcur,T]
             const Dtype ydt = y_cpu.dtype();
             const uint16_t* yp16 = (ydt == Dtype::UInt16) ? y_cpu.data<uint16_t>() : nullptr;
             const int32_t*  yp32 = (ydt == Dtype::Int32)  ? y_cpu.data<int32_t>()  : nullptr;
@@ -1127,7 +1250,7 @@ int main(int argc, char** argv) {
             // if -fopenmp is enabled; harmless no-op otherwise).
             #pragma omp parallel for schedule(dynamic)
             for (int t = 0; t < Tpos; ++t) {
-                for (int bi = 0; bi < Bloc; ++bi) {
+                for (int bi = 0; bi < Bcur; ++bi) {
                     const size_t idx = static_cast<size_t>(bi) * Tpos + t;
                     const float* row = lp + idx * V;
                     float mx = row[0];
