@@ -655,6 +655,29 @@ int main(int argc, char** argv) {
             die("CREAM: scaled_max < T");
     }
 
+    // ---- CP_DUMP_ROPE: dump the YaRN rope cache for the parity gate (plan 0.3) ----
+    // Writes autograd::build_rope_cache(seq_len, head_dim, rope_theta) as raw float32
+    // [seq_len, head_dim] (cols [0:half]=cos*mscale, [half:head_dim]=sin*mscale, the
+    // YARNOps layout) so scripts/convert_ckpt/rope_parity.py --cp-cache can diff it
+    // against HF Qwen3 YaRN. YARN_SCALE / YARN_ORIG_MAXPOS are read by build_rope_cache
+    // from env. Needs no model or checkpoint; forward-only, exits. Placed BEFORE the
+    // T!=context_length guard so CP_T need not be set for a dump.
+    if (const char* rope_path = std::getenv("CP_DUMP_ROPE")) {
+        const int64_t seqlen = env_i64("CP_DUMP_ROPE_SEQLEN", 8192);
+        Tensor cache = autograd::build_rope_cache(seqlen, cfg.head_dim,
+                                                  static_cast<float>(cfg.rope_theta), device);
+        if (is_master) {
+            Tensor c = cache.as_type(Dtype::Float32).to_cpu();
+            std::ofstream rf(rope_path, std::ios::binary);
+            rf.write(reinterpret_cast<const char*>(c.data<float>()),
+                     static_cast<std::streamsize>(c.numel()) * sizeof(float));
+            std::cout << "[dump-rope] wrote YaRN cache [" << seqlen << "," << cfg.head_dim
+                      << "] raw float32 (YARN_SCALE via env) -> " << rope_path << std::endl;
+        }
+        MPI_Finalize();
+        return 0;
+    }
+
     // The base RoPE cache is built at context_length. With CREAM the kernel-facing
     // cache is a per-step gather of the full scaled cache, so T is legitimately
     // decoupled from context_length -- but ONLY under CREAM. The original guard is
