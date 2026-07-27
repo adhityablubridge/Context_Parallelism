@@ -1149,6 +1149,77 @@ int main(int argc, char** argv) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // CP_DUMP_ACTS: per-layer hidden-state dump for the HF forward-parity debug.
+    // Runs a FIXED short input (first CP_DUMP_ACTS_T tokens of CP_EVAL_TOKENS_BIN,
+    // default 32 == fused-kernel tile) through the SAME path the eval uses
+    // (CP_ATTN_MODE=ulysses, CP_SIZE=1), tapping x after embedding, after each
+    // transformer block (attn+mlp), after final norm, and the logits. Each tap is
+    // written raw float32 to <CP_DUMP_ACTS>/cp_<name>.bin. The HF side dumps the
+    // same taps (output_hidden_states) so a layer-by-layer diff localizes the first
+    // divergent op. Forward-only; exits.
+    // ─────────────────────────────────────────────────────────────────────────
+    if (const char* acts_dir = std::getenv("CP_DUMP_ACTS")) {
+        const char* tb = std::getenv("CP_EVAL_TOKENS_BIN");
+        if (!tb) throw std::runtime_error("CP_DUMP_ACTS requires CP_EVAL_TOKENS_BIN (fixed input)");
+        const int Ta = static_cast<int>(env_i64("CP_DUMP_ACTS_T", 32));  // multiple of 32 (fused tile)
+        std::ifstream tf(tb, std::ios::binary);
+        if (!tf) throw std::runtime_error(std::string("CP_DUMP_ACTS: cannot open ") + tb);
+        std::vector<int32_t> toks(static_cast<size_t>(Ta));
+        tf.read(reinterpret_cast<char*>(toks.data()), static_cast<std::streamsize>(Ta) * 4);
+        std::vector<uint16_t> xh(static_cast<size_t>(Ta));
+        for (int t = 0; t < Ta; ++t) {
+            const int32_t v = toks[static_cast<size_t>(t)];
+            if (v < 0 || v >= cfg.vocab_size)
+                throw std::runtime_error("CP_DUMP_ACTS: input token out of [0,vocab)");
+            xh[static_cast<size_t>(t)] = static_cast<uint16_t>(v);
+        }
+        Tensor idx(Shape{{1, static_cast<int64_t>(Ta)}},
+                   TensorOptions().with_dtype(Dtype::UInt16).with_device(device));
+        cudaMemcpy(idx.data(), xh.data(), static_cast<size_t>(Ta) * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice);
+
+        auto dump = [&](const Tensor& t, const std::string& name) {
+            if (!is_master) return;
+            const Tensor c = t.as_type(Dtype::Float32).to_cpu();
+            std::ofstream f(std::string(acts_dir) + "/cp_" + name + ".bin", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(c.data<float>()),
+                    static_cast<std::streamsize>(c.numel()) * sizeof(float));
+        };
+
+        autograd::NoGradGuard ng;
+        Tensor x = model.wte.forward(idx);          // [1, Ta, d_model]
+        dump(x, "embed");
+        {   // layer-0 attention sub-taps: split "before kernel" (input-norm + Q/K proj)
+            // from "inside kernel" (QK-norm+RoPE+scores). Pre-rope, pre-QK-norm.
+            Tensor h0 = model.attn[0]->norm.forward(x);
+            dump(h0, "l0_norm");
+            dump(model.attn[0]->wQ.forward(h0), "l0_qproj");
+            dump(model.attn[0]->wK.forward(h0), "l0_kproj");
+        }
+        for (int i = 0; i < cfg.n_layers; ++i) {
+            x = model.attn[i]->forward(x);           // RMSNorm -> fused(QKnorm+RoPE+GQA) -> Wo -> +x
+            dump(x, "attn" + std::to_string(i));     // post-attention residual (== HF input to post_attn_ln)
+            x = model.mlp[i]->forward(x);            // RMSNorm -> SwiGLU -> +x
+            dump(x, "block" + std::to_string(i));    // full block output (== HF hidden_states[i+1])
+        }
+        x = model.norm_f.forward(x);
+        dump(x, "final");
+        Tensor logits;
+        if (cfg.weight_tying) {
+            Tensor w_t = autograd::transpose(model.wte.weight, 0, 1);
+            logits = autograd::matmul(x, w_t);
+        } else {
+            logits = model.lm_head->forward(x);
+        }
+        dump(logits, "logits");
+        if (is_master)
+            std::cout << "[dump-acts] wrote per-layer activations (T=" << Ta << ") -> "
+                      << acts_dir << std::endl;
+        MPI_Finalize();
+        return 0;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Long-context PPL-vs-position eval (forward-only; exits before training).
     // Requires cp_size==1 so model.forward returns full [B,T,vocab] and each
     // position t maps directly to the global index (no cross-rank NLL gather).

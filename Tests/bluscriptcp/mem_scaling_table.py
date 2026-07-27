@@ -123,6 +123,7 @@ def main():
     #   dsq  -> DS-Qwen3         (torch reserved peak)
     #   dsg  -> DS-GPT2          (torch reserved peak)
     #   lfq  -> LF-Qwen3         (LlamaFactory v1 FSDP2+Ulysses, torch reserved peak)
+    #   usp  -> USP-hybrid       (yunchang Ulysses x Ring hybrid, torch reserved peak)
     #   else -> DS-Ulysses       (fallback)
     def canon_impl(x):
         x = x.lower()
@@ -134,9 +135,22 @@ def main():
             return "DS-GPT2"
         if x == "lfq":
             return "LF-Qwen3"
+        if x == "usp":
+            return "USP-hybrid"
         return "DS-Ulysses"
     for r in records:
         r["impl"] = canon_impl(r["impl"])
+
+    # Normalize the rotator/topology label by world_size: a single GPU has NO context parallelism,
+    # so relabel it "single-gpu" regardless of the configured attn mode (CPP's binary-written snapshot
+    # says "ulysses" even at ws=1, which is misleading). At ws>1 keep the real label (ulysses/ring/...).
+    for r in records:
+        try:
+            ws = int(r.get("world_size") or 0)
+        except Exception:
+            ws = 0
+        if ws == 1:
+            r["rotator"] = "single-gpu"
 
     def sort_key(r):
         try:
@@ -160,7 +174,7 @@ def main():
 
     out_md = os.path.join(OUT_DIR, "mem_scaling_table.md")
     with open(out_md, "w") as f:
-        f.write("# Memory Scaling Results — bluscriptCP vs DeepSpeed-Ulysses Qwen3\n\n")
+        f.write("# Memory Scaling Results — bluscriptCP vs LlamaFactory-v1 vs DeepSpeed-Ulysses (Qwen3)\n\n")
         f.write("`smi_max_used_mb` = max per-GPU MiB from live nvidia-smi "
                 "(includes CUDA context/NCCL), filtered to the run's GPUs — the "
                 "apples-to-apples cross-impl metric. `peak_mb` = each impl's "
