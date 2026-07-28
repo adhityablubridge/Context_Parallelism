@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--kv-heads", type=int, required=True)
     ap.add_argument("--head-dim", type=int, required=True)
     ap.add_argument("--ffn", type=int, required=True)
+    ap.add_argument("--tie", type=int, default=0)
+    ap.add_argument("--vocab", type=int, default=50304)
     ap.add_argument("--B", type=int, default=2)
     ap.add_argument("--T", type=int, required=True)
     ap.add_argument("--steps", type=int, default=200)
@@ -61,7 +63,8 @@ def main():
 
     torch.manual_seed(0)
     model = USPModel(args.d_model, args.n_layer, args.q_heads, args.kv_heads,
-                     args.head_dim, args.ffn, args.ring_impl).to(device).to(torch.bfloat16)
+                     args.head_dim, args.ffn, args.ring_impl, args.vocab,
+                     tie=bool(args.tie)).to(device).to(torch.bfloat16)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     n_params = count_params(model)
     global_tokens = args.B * args.T  # tokens advanced per optimizer step (whole global seq)
@@ -83,13 +86,9 @@ def main():
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
 
-        g = torch.randn(args.B, args.T, args.d_model, device=device, dtype=torch.bfloat16)
-        dist.broadcast(g, src=0)
-        local = shard_sequence(g, rank, world_size, args.ring, args.ulysses, args.ring_impl)
-        local.requires_grad_(True)
-        out = model(local)
-        # autoregressive-shift MSE surrogate: predict next-position hidden.
-        loss = (out[:, :-1].float() - local.detach()[:, 1:].float()).pow(2).mean()
+        ids = torch.randint(0, args.vocab, (args.B, args.T), device=device)
+        dist.broadcast(ids, src=0)
+        loss = model(ids, rank, world_size, args.ring, args.ulysses)  # full LM forward + CE
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()

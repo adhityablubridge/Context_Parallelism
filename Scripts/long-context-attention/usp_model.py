@@ -69,17 +69,46 @@ class USPBlock(nn.Module):
 
 
 class USPModel(nn.Module):
-    def __init__(self, d, n_layers, qh, kvh, hd, ffn, ring_impl_type):
+    """Full LM: embed_tokens -> block stack -> norm -> lm_head. Including the vocab
+    embedding AND lm_head is ESSENTIAL for a fair systems comparison: the lm_head
+    logits [B, T_local, vocab] (+ cross-entropy) are among the largest activations at
+    long context, and bluscriptCP materializes them -- omitting them would make USP
+    appear to fit far more context than it really can.
+
+    forward(input_ids) shards the embedded hidden across the CP mesh (same layout USP
+    expects), runs the blocks on the local shard, then lm_head + CE against the
+    locally-shifted targets. The shift is only exact within a shard (cross-shard next-
+    token pairing is approximate under zigzag) -- fine for a MEMORY/throughput probe,
+    where the point is the activation footprint, not convergence."""
+
+    def __init__(self, d, n_layers, qh, kvh, hd, ffn, ring_impl_type, vocab, tie=True):
         super().__init__()
+        self.d = d
+        self.ring_impl_type = ring_impl_type
+        self.embed_tokens = nn.Embedding(vocab, d)
         self.blocks = nn.ModuleList(
             [USPBlock(d, qh, kvh, hd, ffn, ring_impl_type) for _ in range(n_layers)]
         )
         self.norm_f = RMSNorm(d)
+        self.lm_head = nn.Linear(d, vocab, bias=False)
+        if tie:
+            self.lm_head.weight = self.embed_tokens.weight
 
-    def forward(self, x):
+    def forward(self, input_ids, rank, world_size, ring, uly):
+        # embed the GLOBAL sequence, then shard to this rank's local tokens.
+        h = self.embed_tokens(input_ids)                                  # [B, T, d]
+        h = shard_sequence(h, rank, world_size, ring, uly, self.ring_impl_type)  # [B, Tl, d]
         for blk in self.blocks:
-            x = blk(x)
-        return self.norm_f(x)
+            h = blk(h)
+        h = self.norm_f(h)
+        logits = self.lm_head(h)                                          # [B, Tl, vocab]  <- the big activation
+        # next-token CE within the local shard (shift by 1); memory footprint is the point.
+        lg = logits[:, :-1].reshape(-1, logits.size(-1)).float()
+        # local target ids: shard the same way, shifted.
+        tgt = shard_sequence(input_ids.unsqueeze(-1).float(), rank, world_size, ring, uly,
+                             self.ring_impl_type).squeeze(-1).long()      # [B, Tl]
+        tgt = tgt[:, 1:].reshape(-1)
+        return F.cross_entropy(lg, tgt)
 
 
 def shard_sequence(global_hidden, rank, world_size, ring_degree, ulysses_degree, ring_impl_type):

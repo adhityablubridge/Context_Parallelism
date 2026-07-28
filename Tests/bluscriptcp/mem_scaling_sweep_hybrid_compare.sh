@@ -51,6 +51,17 @@ B="${B:-2}"
 CP_ROTATOR_ENV="${CP_ROTATOR:-p2p}"
 NO_GPUS_PER_NODE_ENV="${NO_GPUS_PER_NODE:-}"
 
+# bluscriptCP memory optimizations (CPP arm only). Passed through to the probe AND
+# tagged into the model label so a flag-OFF baseline and a flag-ON run land as
+# DISTINCT rows in one table (e.g. 114M vs 114M_bs). Value-aware: "0"/unset = off.
+CP_RING_BF16_ENV="${CP_RING_BF16:-0}"                 # Opt B: bf16 KV wire transport
+CP_SHARE_FWD_ROTATOR_ENV="${CP_SHARE_FWD_ROTATOR:-0}" # Opt A: shared cross-layer ring holder
+_on() { [[ -n "$1" && ! ( "${1:0:1}" == "0" && ${#1} -eq 1 ) ]]; }   # on unless unset/empty/"0"
+CPP_FLAG_SUFFIX=""
+_on "$CP_RING_BF16_ENV"         && CPP_FLAG_SUFFIX="${CPP_FLAG_SUFFIX}b"
+_on "$CP_SHARE_FWD_ROTATOR_ENV" && CPP_FLAG_SUFFIX="${CPP_FLAG_SUFFIX}s"
+[[ -n "$CPP_FLAG_SUFFIX" ]] && CPP_FLAG_SUFFIX="_${CPP_FLAG_SUFFIX}"  # _b / _s / _bs, empty if both off
+
 # Topology matrix: "RING ULYSSES RING_OUTER".  CP_SIZE = RING*ULYSSES.
 TOPOLOGIES=(
   "1 2 0"   # pure Ulysses (CP=2)
@@ -74,11 +85,19 @@ WORLD_SIZE="$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')"
 FAST_DOMAIN="${NO_GPUS_PER_NODE_ENV:-$WORLD_SIZE}"
 IFS=',' read -r -a GPU_ARR <<< "$CUDA_VISIBLE_DEVICES"
 
+# RESUME=1: skip any (impl,topology,T) already recorded in results.csv and pick up exactly where a
+# prior interrupted run stopped. Cached OK/OOM outcomes replay instantly so the deterministic
+# doubling+bisection reproduces and resumes at the first unfinished T. Implies keep-existing (no wipe).
+declare -A DONE
+RESUME="${RESUME:-0}"
+
 # ---- Stale-output guard ----
 if [[ -d "$OUT_DIR" ]]; then
   stale_count=$(find "$OUT_DIR" -maxdepth 1 -name '*.txt' 2>/dev/null | wc -l)
   if (( stale_count > 0 )); then
-    if [[ "${CLEAN:-0}" == "1" ]]; then
+    if [[ "$RESUME" == "1" ]]; then
+      echo "[GUARD] RESUME=1 -> keeping $stale_count existing snapshot(s); finished runs will be skipped."
+    elif [[ "${CLEAN:-0}" == "1" ]]; then
       echo "[GUARD] CLEAN=1 -> removing $stale_count stale snapshot(s) in $OUT_DIR"
       rm -f "$OUT_DIR"/*.txt "$OUT_DIR"/mem_scaling_results.csv \
             "$OUT_DIR"/mem_scaling_table.csv "$OUT_DIR"/mem_scaling_table.md \
@@ -86,19 +105,29 @@ if [[ -d "$OUT_DIR" ]]; then
     elif [[ "${FORCE:-0}" == "1" ]]; then
       echo "[GUARD] FORCE=1 -> proceeding into non-empty $OUT_DIR"
     else
-      echo "ERROR: $OUT_DIR already has $stale_count snapshot(s). Use CLEAN=1 or FORCE=1." >&2
+      echo "ERROR: $OUT_DIR already has $stale_count snapshot(s). Use CLEAN=1, RESUME=1, or FORCE=1." >&2
       exit 1
     fi
   fi
 fi
 mkdir -p "$OUT_DIR"; LOG_DIR="${OUT_DIR}/logs"; mkdir -p "$LOG_DIR"
 RESULTS_CSV="${OUT_DIR}/mem_scaling_results.csv"
-echo "impl,label,rotator,n_embd,n_layer,n_head,weight_tying,T,world_size,status,snapshot" > "$RESULTS_CSV"
+if [[ "$RESUME" == "1" && -f "$RESULTS_CSV" ]]; then
+  # Load prior outcomes: key by snapshot basename (== the run's tag), value = OK/OOM.
+  while IFS=, read -r _im _lb _ro _ne _nl _nh _wt _T _ws _st _snap; do
+    [[ "$_im" == "impl" || -z "$_snap" ]] && continue
+    DONE["$(basename "$_snap" .txt)"]="$_st"
+  done < "$RESULTS_CSV"
+  echo "[RESUME] loaded ${#DONE[@]} completed run(s) from $RESULTS_CSV; these will be skipped (cached)."
+else
+  echo "impl,label,rotator,n_embd,n_layer,n_head,weight_tying,T,world_size,status,snapshot" > "$RESULTS_CSV"
+fi
 
 echo "=============================================================="
 echo " HYBRID compare:  bluscriptCP  vs  USP/yunchang  (Ring x Ulysses)"
 echo "   CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (world_size=$WORLD_SIZE)"
 echo "   RUN_CPP=$RUN_CPP  RUN_USP=$RUN_USP (ring_impl=$RING_IMPL)"
+echo "   CPP opts: CP_RING_BF16=$CP_RING_BF16_ENV  CP_SHARE_FWD_ROTATOR=$CP_SHARE_FWD_ROTATOR_ENV  label_suffix='${CPP_FLAG_SUFFIX}'"
 echo "   T: $T_START -> x2 -> <=$T_MAX  PROBE_STEPS=$PROBE_STEPS  B=$B"
 echo "   OUT_DIR=$OUT_DIR"
 echo "=============================================================="
@@ -144,18 +173,24 @@ t_ok() {
 run_cpp() {  # label d l qh kvh ffn ty ring uly ro T
   local label="$1" d="$2" l="$3" qh="$4" kvh="$5" ffn="$6" ty="$7" ring="$8" uly="$9" ro="${10}" T="${11}"
   local cp=$(( ring * uly )) rolab=""; [[ "$ro" == "1" ]] && rolab="ro"
-  local mlabel="${label}_r${ring}u${uly}${rolab}"
+  local mlabel="${label}${CPP_FLAG_SUFFIX}_r${ring}u${uly}${rolab}"
   local tag="CPP_${mlabel}_${CP_ROTATOR_ENV}_T${T}_ws${WORLD_SIZE}"
-  local snap="${OUT_DIR}/${tag}.txt" log="${LOG_DIR}/${tag}.log"; rm -f "$snap"
+  local snap="${OUT_DIR}/${tag}.txt" log="${LOG_DIR}/${tag}.log"
+  if [[ -n "${DONE[$tag]:-}" ]]; then
+    echo "  [resume] cached CPP $tag=${DONE[$tag]} (skip)"; [[ "${DONE[$tag]}" == "OK" ]] && return 0 || return 1
+  fi
+  rm -f "$snap"
   echo "  -> [CPP] $mlabel ring=$ring uly=$uly ro=$ro dp=$(( WORLD_SIZE / cp )) T=$T"
   CP_MEM_PROBE=1 CP_MEM_PROBE_STEPS="$PROBE_STEPS" CP_MODEL_LABEL="$mlabel" \
   CP_ATTN_MODE=hybrid CP_SIZE="$cp" CP_ULYSSES_SIZE="$uly" CP_RING_OUTER="$ro" \
   CP_ROTATOR="$CP_ROTATOR_ENV" NO_GPUS_PER_NODE="$FAST_DOMAIN" CP_B="$B" \
   CP_N_EMBD="$d" CP_N_LAYER="$l" CP_N_HEAD="$qh" CP_N_KVHEAD="$kvh" \
   CP_FFN="$ffn" CP_WEIGHT_TYING="$ty" CP_T="$T" \
+  CP_RING_BF16="$CP_RING_BF16_ENV" CP_SHARE_FWD_ROTATOR="$CP_SHARE_FWD_ROTATOR_ENV" \
   CP_CKPT=0 CP_DATA_ROOT="$DATA_ROOT" MEM_SNAPSHOT_DIR="$OUT_DIR" \
   LD_LIBRARY_PATH="${TENSOR_LIBDIR}:${PROFILER_LIBDIR}:${LD_LIBRARY_PATH:-}" \
-  timeout "$RUN_TIMEOUT" mpirun -x LD_LIBRARY_PATH -np "$WORLD_SIZE" "$CPP_EXEC" > "$log" 2>&1
+  timeout "$RUN_TIMEOUT" mpirun -x LD_LIBRARY_PATH -x CP_RING_BF16 -x CP_SHARE_FWD_ROTATOR \
+    -np "$WORLD_SIZE" "$CPP_EXEC" > "$log" 2>&1
   local rc=$?
   if is_fail "$log" "$rc" "$snap"; then
     echo "CPP,${mlabel},${CP_ROTATOR_ENV},${d},${l},${qh},${ty},${T},${WORLD_SIZE},OOM,${snap}" >> "$RESULTS_CSV"; return 1
@@ -169,7 +204,11 @@ run_usp() {  # label d l qh kvh ffn ty ring uly ro T
   local mlabel="${label}_r${ring}u${uly}${rolab}"
   local hd=$(( d / qh ))
   local tag="USP_${mlabel}_${CP_ROTATOR_ENV}_T${T}_ws${cp}"
-  local snap="${OUT_DIR}/${tag}.txt" log="${LOG_DIR}/${tag}.log"; rm -f "$snap"
+  local snap="${OUT_DIR}/${tag}.txt" log="${LOG_DIR}/${tag}.log"
+  if [[ -n "${DONE[$tag]:-}" ]]; then
+    echo "  [resume] cached USP $tag=${DONE[$tag]} (skip)"; [[ "${DONE[$tag]}" == "OK" ]] && return 0 || return 1
+  fi
+  rm -f "$snap"
   # USP runs dp=1 on the first cp visible GPUs.
   local usp_gpus; usp_gpus="$(IFS=,; echo "${GPU_ARR[*]:0:cp}")"
   echo "  -> [USP] $mlabel ring=$ring uly=$uly (dp=1, gpus=$usp_gpus, impl=$RING_IMPL) T=$T"

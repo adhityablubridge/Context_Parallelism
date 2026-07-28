@@ -49,6 +49,15 @@ def parse_snapshot(path):
                 m = re.search(r"torch\.peak_alloc_mb\(rank0\)=([\d.]+)", line)
                 if m:
                     rec["torch_peak_alloc_mb"] = m.group(1)
+            elif "reserved_peak_mb" in line and not rec["torch_peak_reserved_mb"]:
+                # bluscriptCP's ALLOC_PEAK line -> the SAME torch caching-allocator peak USP reports,
+                # so both impls expose a per-process reserved peak (apples-to-apples, context-excluded).
+                m = re.search(r"reserved_peak_mb=([\d.]+)", line)
+                if m:
+                    rec["torch_peak_reserved_mb"] = m.group(1)
+                m = re.search(r"active_peak_mb=([\d.]+)", line)
+                if m:
+                    rec["torch_peak_alloc_mb"] = m.group(1)
             elif "cudaMemGetInfo used_mb" in line:
                 m = re.search(r"used_mb\(rank0\)=([\d.]+)", line)
                 if m:
@@ -75,7 +84,7 @@ def main():
     for fn in sorted(os.listdir(OUT_DIR)):
         if fn.endswith(".txt") and (fn.startswith("CPP_") or
                                     fn.startswith("DSQ_") or fn.startswith("DSG_") or
-                                    fn.startswith("LFQ_")):
+                                    fn.startswith("LFQ_") or fn.startswith("USP_")):
             records.append(parse_snapshot(os.path.join(OUT_DIR, fn)))
 
     # Fold in OOM rows from results.csv (runs that produced no snapshot).

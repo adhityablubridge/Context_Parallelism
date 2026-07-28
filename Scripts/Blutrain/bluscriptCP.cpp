@@ -845,6 +845,22 @@ int main(int argc, char** argv) {
     GPT model(cfg, device, mesh, cp_pg, cp_size, cp_rank,
               ulysses_pg, ring_rank, ulysses_rank, /*seed=*/1234);
 
+    // CP_SHARE_FWD_ROTATOR=1 (additive, default OFF): share ONE forward ring holder
+    // (rotator + send_buf[2] + persistent exch_work) across all layers instead of
+    // one set per layer. Forward is sequential (layer i finishes before i+1), so a
+    // single set suffices and saves ~kv_staging * n_layers resident memory. Unset =>
+    // per-layer path, byte-identical to before. Value-aware, mirrors CP_NO_OVERLAP.
+    {
+        const char* _share = std::getenv("CP_SHARE_FWD_ROTATOR");
+        if (_share && !(_share[0] == '0' && _share[1] == '\0')) {
+            auto holder = std::make_shared<ContextParallel::SharedFwdRing>();
+            for (auto& a : model.attn) a->cp_->set_shared_fwd_ring(holder);
+            if (is_master)
+                std::cout << "[CP] CP_SHARE_FWD_ROTATOR=1: one forward ring holder shared across "
+                          << model.attn.size() << " layers." << std::endl;
+        }
+    }
+
     auto params = model.parameters();
     int64_t num_params = 0;
     for (auto& p : params) num_params += p.numel();

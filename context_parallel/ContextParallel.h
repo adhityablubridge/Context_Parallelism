@@ -286,6 +286,13 @@ public:
     std::unique_ptr<RingRotatorBase> rotator;
     Tensor send_buf[2];
     int64_t kv_numel = -1;
+    // Cross-layer send-completion guard. send_buf[2] is shared across layers, but
+    // the per-forward_cp `exch_work` was stack-local, so layer N+1's reuse of
+    // send_buf[s] could race layer N's still-in-flight send. Persisting the Work
+    // handles here (used via the alias in forward_cp) makes the existing
+    // streamWait guard order the reuse after the prior layer's send. Default-inits
+    // to nullptr (no prior send on the first layer).
+    std::shared_ptr<Work> exch_work[2];
   };
   void set_shared_fwd_ring(std::shared_ptr<SharedFwdRing> r) {
     shared_fwd_ring_ = std::move(r);
@@ -547,6 +554,18 @@ public:
         OVERLAP = false;
     cudaStream_t compute_stream = OwnTensor::cuda::getCurrentStream();
 
+    // CP_RING_BF16=1: transport the rotated KV on the wire in bf16 (half the ring
+    // staging + NCCL bytes). Read once. Excluded for AllGather (its index_chunk
+    // uses fp32 sizeof/stride math). Numerically net-zero: the fused SDPA kernel
+    // already casts KV to bf16 internally, and fp32->bf16 rounding is idempotent,
+    // so the attention sees the same bf16 values either way. Value-aware default
+    // OFF (unset or "0" => OFF), mirroring CP_NO_OVERLAP.
+    const char *_ring_bf16 = std::getenv("CP_RING_BF16");
+    static const bool RING_BF16 =
+        (_ring_bf16 != nullptr) && !(_ring_bf16[0] == '0' && _ring_bf16[1] == '\0') &&
+        rotator_type_ != RotatorType::AllGather;
+    const Dtype ring_dt = RING_BF16 ? Dtype::Bfloat16 : Dtype::Float32;
+
     int64_t k_numel = local_k.numel();
     int64_t kv_numel = k_numel * 2;
     // [#6] Persistent double-buffered send staging + rotator, keyed on the
@@ -561,12 +580,20 @@ public:
     // change), so neither churns the allocator. The shared path simply makes a
     // single set serve every layer (forward is sequential), saving the
     // ~kv_numel*2 * n_layers resident staging.
+    // Staging-buffer opts: bf16 (raw, no grad) when RING_BF16, else the original
+    // local_k.opts() (fp32) -> OFF path byte-identical. The recv slots inside the
+    // rotator inherit curr_buffer.opts(), so they follow this dtype automatically.
+    // The kv_numel guard keys on element count (dtype-invariant); RING_BF16 is read
+    // once at startup, so the dtype is fixed for the run -- no mid-run flip.
+    const TensorOptions sb_opts =
+        RING_BF16 ? local_k.opts().with_dtype(Dtype::Bfloat16).with_req_grad(false)
+                  : local_k.opts();
     Tensor *send_buf;
     if (shared_fwd_ring_) {
       SharedFwdRing &R = *shared_fwd_ring_;
       if (R.kv_numel != kv_numel) {
-        R.send_buf[0] = Tensor::empty(Shape({{kv_numel}}), local_k.opts());
-        R.send_buf[1] = Tensor::empty(Shape({{kv_numel}}), local_k.opts());
+        R.send_buf[0] = Tensor::empty(Shape({{kv_numel}}), sb_opts);
+        R.send_buf[1] = Tensor::empty(Shape({{kv_numel}}), sb_opts);
         R.rotator = create_rotator(); // fresh recv_ slots for new size
         R.kv_numel = kv_numel;
       }
@@ -574,8 +601,8 @@ public:
       send_buf = R.send_buf;
     } else {
       if (persistent_kv_numel_ != kv_numel) {
-        send_buf_[0] = Tensor::empty(Shape({{kv_numel}}), local_k.opts());
-        send_buf_[1] = Tensor::empty(Shape({{kv_numel}}), local_k.opts());
+        send_buf_[0] = Tensor::empty(Shape({{kv_numel}}), sb_opts);
+        send_buf_[1] = Tensor::empty(Shape({{kv_numel}}), sb_opts);
         kv_rotator_persistent_ = create_rotator(); // fresh recv_ slots for new size
         persistent_kv_numel_ = kv_numel;
       }
@@ -592,7 +619,15 @@ public:
     // (no allocator churn, no event-destroy UB). With a SHARED rotator this also
     // re-arms it cleanly for each layer's independent ring.
     kv_rotator->reset();
-    std::shared_ptr<Work> exch_work[2] = {nullptr, nullptr};  // [#1] per send slot
+    // [#1] Send-completion handles, per ping-pong slot. When the ring is shared
+    // across layers (CP_SHARE_FWD_ROTATOR), these MUST persist in the holder so
+    // layer N+1's reuse of the shared send_buf[s] is stream-ordered after layer
+    // N's still-in-flight send (the guard at the memcpy below reads them). A
+    // single alias is used at BOTH the read (guard) and write (assignment) sites
+    // so they cannot drift apart. Per-instance path keeps the stack-local.
+    std::shared_ptr<Work> local_exch_work[2] = {nullptr, nullptr};
+    std::shared_ptr<Work> *exch_work =
+        shared_fwd_ring_ ? shared_fwd_ring_->exch_work : local_exch_work;
     // Pack-ordering events are OWNED by the rotator (persistent, per-slot).
     // Never create/destroy them per call: destroying an event with a pending
     // cudaStreamWaitEvent referencing it is unconditional UB (it was a race at
@@ -623,8 +658,15 @@ public:
         if (_fwd_sync_recv && _fwd_sync_recv[0] == '1')
           cudaStreamSynchronize(pg_->cpRingStream());
         Tensor kv_flat = next_kv.flatten();
-        curr_k = kv_flat.narrow(0, 0, k_numel).reshape(local_k.shape());
-        curr_v = kv_flat.narrow(0, k_numel, k_numel).reshape(local_v.shape());
+        Tensor rk = kv_flat.narrow(0, 0, k_numel).reshape(local_k.shape());
+        Tensor rv = kv_flat.narrow(0, k_numel, k_numel).reshape(local_v.shape());
+        // RING_BF16: the received buffer is bf16. Upcast to fp32 IMMEDIATELY, before
+        // BOTH the SDPA (fp32-only fused kernel) AND the save-for-backward clone
+        // (curr_k.clone() below) -- so saved_k_chunks stay fp32 and bf16 never leaks
+        // into the (untouched) backward pass, in either recompute_k mode. OFF path
+        // is the plain view assignment, byte-identical to before.
+        curr_k = RING_BF16 ? rk.as_type(Dtype::Float32) : rk;
+        curr_v = RING_BF16 ? rv.as_type(Dtype::Float32) : rv;
       }
 
       // Step 2: Send current K,V to next rank (async; recv lands in the OTHER
@@ -634,12 +676,27 @@ public:
         // [#1] Before reusing send_buf[s] (last used at step i-2), ensure that
         // send has drained reading it. GPU-side; usually already complete.
         if (OVERLAP && exch_work[s]) exch_work[s]->streamWait(compute_stream);
-        size_t k_bytes = static_cast<size_t>(k_numel) * sizeof(float);
-        cudaMemcpyAsync(send_buf[s].data<float>(), curr_k.data<float>(),
-                        k_bytes, cudaMemcpyDeviceToDevice, compute_stream);
-        cudaMemcpyAsync(send_buf[s].data<float>() + k_numel,
-                        curr_v.data<float>(), k_bytes, cudaMemcpyDeviceToDevice,
-                        compute_stream);
+        if (RING_BF16) {
+          // Convert fp32 curr_k/curr_v -> bf16 and pack into the two halves of the
+          // bf16 send_buf (element offset +k_numel; bfloat16_t itemsize = 2B). The
+          // as_type temps run on compute_stream, the same FIFO stream as this
+          // memcpy and the ensuing send, so their storage cannot be recycled early.
+          Tensor kb = curr_k.as_type(Dtype::Bfloat16).flatten();
+          Tensor vb = curr_v.as_type(Dtype::Bfloat16).flatten();
+          size_t kb_bytes = static_cast<size_t>(k_numel) * sizeof(bfloat16_t);
+          cudaMemcpyAsync(send_buf[s].data<bfloat16_t>(), kb.data<bfloat16_t>(),
+                          kb_bytes, cudaMemcpyDeviceToDevice, compute_stream);
+          cudaMemcpyAsync(send_buf[s].data<bfloat16_t>() + k_numel,
+                          vb.data<bfloat16_t>(), kb_bytes, cudaMemcpyDeviceToDevice,
+                          compute_stream);
+        } else {
+          size_t k_bytes = static_cast<size_t>(k_numel) * sizeof(float);
+          cudaMemcpyAsync(send_buf[s].data<float>(), curr_k.data<float>(),
+                          k_bytes, cudaMemcpyDeviceToDevice, compute_stream);
+          cudaMemcpyAsync(send_buf[s].data<float>() + k_numel,
+                          curr_v.data<float>(), k_bytes, cudaMemcpyDeviceToDevice,
+                          compute_stream);
+        }
         nvtxRangePushA("CP.fwd.ring.exchange_buffers");
         // Explicit overlap flag + the pack (compute) stream. The flag is
         // separate because compute may run on the legacy NULL stream (0),

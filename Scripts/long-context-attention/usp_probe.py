@@ -45,6 +45,7 @@ def main():
     ap.add_argument("--head-dim", type=int, required=True)
     ap.add_argument("--ffn", type=int, required=True)
     ap.add_argument("--tie", type=int, default=0)
+    ap.add_argument("--vocab", type=int, default=50304)
     ap.add_argument("--B", type=int, default=2)
     ap.add_argument("--T", type=int, required=True)
     ap.add_argument("--steps", type=int, default=2)
@@ -68,7 +69,8 @@ def main():
 
     torch.manual_seed(0)
     model = USPModel(args.d_model, args.n_layer, args.q_heads, args.kv_heads,
-                     args.head_dim, args.ffn, args.ring_impl).to(device).to(torch.bfloat16)
+                     args.head_dim, args.ffn, args.ring_impl, args.vocab,
+                     tie=bool(args.tie)).to(device).to(torch.bfloat16)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
     n_params = count_params(model)
 
@@ -77,13 +79,11 @@ def main():
     err = ""
     try:
         for _ in range(args.steps):
-            # Global hidden -> local shard (same layout USP expects for this ring impl).
-            g = torch.randn(args.B, args.T, args.d_model, device=device, dtype=torch.bfloat16)
-            dist.broadcast(g, src=0)
-            local = shard_sequence(g, rank, world_size, args.ring, args.ulysses, args.ring_impl)
-            local.requires_grad_(True)
-            out = model(local)
-            loss = out.float().pow(2).mean()
+            # Full LM forward: global token ids -> embed -> shard -> blocks -> lm_head -> CE.
+            # (lm_head logits are the big long-context activation -- must be present for fairness.)
+            ids = torch.randint(0, args.vocab, (args.B, args.T), device=device)
+            dist.broadcast(ids, src=0)
+            loss = model(ids, rank, world_size, args.ring, args.ulysses)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
