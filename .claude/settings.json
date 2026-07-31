@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /home/blu-bridge25/CP *)",
+      "Read(//home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/**)",
+      "Bash(cd \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault\"; tail -1 \"Claude Logs.md\" | cut -c1-120)",
+      "Bash(grep -o 'CP_RING_BF16.*$')",
+      "Bash(awk 'END{print substr\\($0, length\\($0\\)-90\\)}' \"Claude Logs.md\")",
+      "Bash(awk 'END{print substr\\($0, length\\($0\\)-70\\)}' \"Claude Logs.md\")",
+      "Bash(awk 'END{print substr\\($0, length\\($0\\)-55\\)}' \"Claude Logs.md\")",
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)"
+    ],
+    "additionalDirectories": [
+      "/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault"
+    ]
+  }
+}

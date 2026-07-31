@@ -258,6 +258,12 @@ for row in "${CONFIGS[@]}"; do
   echo ""; echo "######## CONFIG: $label (d=$d L=$l q=$qh kv=$kvh ffn=$ffn tie=$ty) ########"
   for topo in "${TOPOLOGIES[@]}"; do
     read -r ring uly ro <<< "$topo"
+    # ONLY_CP=<n>: restrict to a single CP degree (CP=ring*uly). Use ONLY_CP=8 on an
+    # 8-GPU run to skip the CP<8 rows already covered (identically, per-rank) by the
+    # 4-GPU sweep. Unset = all topologies.
+    if [[ -n "${ONLY_CP:-}" && "$(( ring * uly ))" != "$ONLY_CP" ]]; then
+      echo "  (skip $label r${ring}u${uly}: CP=$(( ring * uly )) != ONLY_CP=$ONLY_CP)"; continue
+    fi
     echo ""; echo "==== $label  ring=$ring x uly=$uly (CP=$(( ring * uly ))) ring_outer=$ro ===="
     [[ "$RUN_CPP" == "1" ]] && sweep_arm cpp "$label" "$d" "$l" "$qh" "$kvh" "$ffn" "$ty" "$ring" "$uly" "$ro"
     [[ "$RUN_USP" == "1" ]] && sweep_arm usp "$label" "$d" "$l" "$qh" "$kvh" "$ffn" "$ty" "$ring" "$uly" "$ro"
