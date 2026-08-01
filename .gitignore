@@ -27,9 +27,29 @@ CP_GPT2_Training_logs/
 CP_BluScreipt_Training_logs/
 mem_scaling_runs_bluscriptcp/
 mem_scaling_runs_hybrid/
-1step*.csv
+mem_scaling_runs_fine_ulysses/
+mem_scaling_runs_bluscriptcp_ws2/
+mem_scaling_runs_bluscriptcp_ws4/
+mem_scaling_runs_bluscriptcp_ws8/
+mem_scaling_runs_hybrid_ws4/
+mem_scaling_runs_hybrid_ws8/
+mem_scaling_runs_fine/
+mem_scaling_runs_bluscriptcp_LF_ws1/
+mem_scaling_runs_bluscriptcp_LF_ws2/
+mem_scaling_runs_bluscriptcp_LF_ws4/
+mem_scaling_runs_bluscriptcp__LF_ws1/
+mem_scaling_runs_cpp_48m_ws2/
+mem_scaling_runs_ws2_recovered/
+CP_Bluscript_Training_logs/
+Scripts/Pytorch/adhitya_venv/
+checkpoints_bluscriptcp/
 debug_rank_*.md
 *.png
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
 
 # Python caches
 __pycache__/
