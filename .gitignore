@@ -46,10 +46,9 @@ checkpoints_bluscriptcp/
 debug_rank_*.md
 *.png
 
-# Python caches
-__pycache__/
-*.pyc
-*.pyo
+# Notebooks: per-machine (each plots its own local results); NOT versioned.
+# Force-add a specific one with `git add -f <file>` if you ever need to share it.
+*.ipynb
 
 # Python caches
 __pycache__/
