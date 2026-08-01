@@ -63,6 +63,7 @@
 #include "process_group/device_mesh.h"          // DeviceMesh (canonical PG, ncclCommSplit)
 #include "context_parallel/ContextParallel.h"   // ContextParallel, shard_sequence_pre_embed, RotatorType
 #include "context_parallel/CreamPositions.h"     // CREAM/PoSE/RandPos position-label generators
+#include "context_parallel/LongRoPEOps.h"         // build_rope_cache_longrope (searched cache)
 #include "ops/IndexingOps.h"                      // gather (cache-row select for CREAM)
 
 using namespace OwnTensor;
@@ -145,6 +146,17 @@ struct ModelConfig {
     uint64_t    cream_seed      = 0;                      // CP_CREAM_SEED base (0 => step-derived)
     int         cream_factor    = 0;                      // = YARN_SCALE (resolved in main)
     int64_t     cream_scaled_max = 0;                     // = cream_factor * T (resolved in main)
+
+    // ---- LongRoPE searched-cache extension (additive; env-resolved) ----
+    // "" (default) => off, byte-identical. When set, a searched per-dim rescale
+    // vector + n_hat build a LongRoPE cos/sin cache (context_parallel/LongRoPEOps.h).
+    // LongRoPE-alone installs the cache directly; composed with CREAM it becomes the
+    // gather source (must satisfy longrope_search_len == cream_scaled_max, s==factor).
+    std::string        longrope_factors    = "";          // CP_LONGROPE_FACTORS (path)
+    std::vector<float> longrope_lambda;                   // parsed per-dim factors (len head_dim/2)
+    int64_t            longrope_n_hat      = 0;            // initial-token threshold
+    int                longrope_s          = 0;           // extension ratio recorded in file
+    int64_t            longrope_search_len = 0;           // S_search recorded in file
 
     // ---- checkpointing ----
     bool        checkpointing = true;
@@ -365,9 +377,17 @@ public:
         // `pos` holds the YaRN-interpolated cos/sin for absolute position `pos`. Only
         // built when CREAM is on; the base cos_sin_cache above is left untouched.
         if (c.cream_mode != "off") {
-            cream_full_cache_ = autograd::build_rope_cache(
-                c.cream_scaled_max, c.head_dim,
-                static_cast<float>(c.rope_theta), dev);
+            if (!c.longrope_factors.empty()) {
+                // COMPOSITION: gather source is the searched LongRoPE cache (built at
+                // cream_scaled_max; coupling asserted in main). Replaces the YaRN source.
+                cream_full_cache_ = autograd::build_rope_cache_longrope(
+                    c.cream_scaled_max, c.head_dim, static_cast<float>(c.rope_theta),
+                    c.longrope_lambda, c.longrope_n_hat, dev);
+            } else {
+                cream_full_cache_ = autograd::build_rope_cache(
+                    c.cream_scaled_max, c.head_dim,
+                    static_cast<float>(c.rope_theta), dev);
+            }
         }
 
         for (int i = 0; i < c.n_layers; ++i) {
@@ -389,6 +409,17 @@ public:
         register_module(wte);
         register_module(norm_f);
         if (!c.weight_tying && lm_head) register_module(lm_head.get());
+
+        // LongRoPE-ALONE (no CREAM): the searched cache is STATIC (no per-step
+        // relabeling), so build it once at context_length and install on every layer
+        // here. Composed-with-CREAM is handled by the gather source above + the
+        // per-step install. Off (empty factors) leaves the base cache untouched.
+        if (!c.longrope_factors.empty() && c.cream_mode == "off") {
+            Tensor lr = autograd::build_rope_cache_longrope(
+                c.context_length, c.head_dim, static_cast<float>(c.rope_theta),
+                c.longrope_lambda, c.longrope_n_hat, dev);
+            for (auto& a : attn) a->cp_->set_rope_cache(lr);
+        }
     }
 
     // idx [B, T] (full, UInt16/Int) -> logits [B, T_local, vocab] on the CP shard.
@@ -497,6 +528,45 @@ static float get_lr(int step, float max_lr, float min_lr, int warmup, int max_st
 
 static int64_t env_i64(const char* k, int64_t d) {
     const char* v = std::getenv(k); return v ? std::atoll(v) : d;
+}
+
+// Parse a LongRoPE factors file. Format (whitespace-separated, keys in any order):
+//   n_hat <int>
+//   s <int>                (extension ratio the search used)
+//   S_search <int>         (target length the search targeted; = factor*T when composed)
+//   lambda <f0> <f1> ... <f_{half-1}>     (head_dim/2 monotone-nondecreasing values >= 1)
+// '#'-prefixed tokens skip to end of line (comments). Throws on any malformation.
+static void parse_longrope_factors(const std::string& path, int64_t half,
+                                   std::vector<float>& lambda, int64_t& n_hat,
+                                   int& s, int64_t& search_len) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("CP_LONGROPE_FACTORS: cannot open '" + path + "'");
+    lambda.clear(); n_hat = -1; s = -1; search_len = -1;
+    std::string tok;
+    while (f >> tok) {
+        if (tok == "n_hat")         { if (!(f >> n_hat))      throw std::runtime_error("CP_LONGROPE_FACTORS: bad n_hat"); }
+        else if (tok == "s")        { if (!(f >> s))          throw std::runtime_error("CP_LONGROPE_FACTORS: bad s"); }
+        else if (tok == "S_search") { if (!(f >> search_len)) throw std::runtime_error("CP_LONGROPE_FACTORS: bad S_search"); }
+        else if (tok == "lambda") {
+            lambda.resize(static_cast<size_t>(half));
+            for (int64_t i = 0; i < half; ++i)
+                if (!(f >> lambda[static_cast<size_t>(i)]))
+                    throw std::runtime_error("CP_LONGROPE_FACTORS: expected " +
+                                             std::to_string(half) + " lambda values");
+        }
+        else if (!tok.empty() && tok[0] == '#') { std::string rest; std::getline(f, rest); }
+        else throw std::runtime_error("CP_LONGROPE_FACTORS: unexpected token '" + tok + "'");
+    }
+    if (static_cast<int64_t>(lambda.size()) != half)
+        throw std::runtime_error("CP_LONGROPE_FACTORS: missing/short 'lambda' (need " +
+                                 std::to_string(half) + ")");
+    if (n_hat < 0) throw std::runtime_error("CP_LONGROPE_FACTORS: missing 'n_hat'");
+    for (int64_t i = 0; i < half; ++i) {
+        if (!(lambda[static_cast<size_t>(i)] >= 1.0f))
+            throw std::runtime_error("CP_LONGROPE_FACTORS: lambda must be >= 1");
+        if (i > 0 && lambda[static_cast<size_t>(i)] < lambda[static_cast<size_t>(i - 1)])
+            throw std::runtime_error("CP_LONGROPE_FACTORS: lambda must be non-decreasing");
+    }
 }
 
 // =============================================================================
@@ -653,6 +723,36 @@ int main(int argc, char** argv) {
             die("CREAM: scaled_max must be a multiple of T");
         if (cfg.cream_scaled_max < cfg.T)
             die("CREAM: scaled_max < T");
+    }
+
+    // ---- LongRoPE searched-cache extension (additive; env-resolved) ----
+    // CP_LONGROPE_FACTORS=<file> installs a searched per-dim rescale cache. Unset =>
+    // byte-identical. Composed with CREAM (both set): the LongRoPE cache is CREAM's
+    // gather source and MUST have been searched at the same target length/ratio.
+    if (const char* e = std::getenv("CP_LONGROPE_FACTORS")) cfg.longrope_factors = e;
+    const bool longrope_on = !cfg.longrope_factors.empty();
+    if (longrope_on) {
+        const int64_t half = cfg.head_dim / 2;
+        try {
+            parse_longrope_factors(cfg.longrope_factors, half, cfg.longrope_lambda,
+                                   cfg.longrope_n_hat, cfg.longrope_s, cfg.longrope_search_len);
+        } catch (const std::exception& ex) { die(ex.what()); }
+        if (cream_on) {
+            // Composition coupling: CREAM's tail labels reach cream_scaled_max, so the
+            // LongRoPE gather source must be that long AND tuned for that target.
+            if (cfg.longrope_search_len != cfg.cream_scaled_max)
+                die("LongRoPE S_search (" + std::to_string(cfg.longrope_search_len) +
+                    ") != cream_scaled_max (" + std::to_string(cfg.cream_scaled_max) +
+                    ") -- search the LongRoPE cache at factor*T");
+            if (cfg.longrope_s != cfg.cream_factor)
+                die("LongRoPE s (" + std::to_string(cfg.longrope_s) +
+                    ") != cream factor (" + std::to_string(cfg.cream_factor) + ")");
+        }
+        if (is_master)
+            std::cout << "[LongRoPE] factors=" << cfg.longrope_factors
+                      << " n_hat=" << cfg.longrope_n_hat << " s=" << cfg.longrope_s
+                      << " S_search=" << cfg.longrope_search_len
+                      << (cream_on ? " (composed with CREAM)" : " (alone)") << std::endl;
     }
 
     // ---- CP_DUMP_ROPE: dump the YaRN rope cache for the parity gate (plan 0.3) ----
@@ -1242,6 +1342,79 @@ int main(int argc, char** argv) {
     // Teacher-forces CP_EVAL_WINDOWS contiguous windows of length T from the
     // chosen split and accumulates per-position NLL; PPL(t) = exp(mean_nll(t)).
     // ─────────────────────────────────────────────────────────────────────────
+    // CP_LONGROPE_SEARCH: resident evaluator for the LongRoPE GA driver. Loads the
+    // model+ckpt ONCE (above), then loops reading candidate factor-file paths from
+    // stdin; for each it rebuilds ONLY the cheap CPU LongRoPE cache, installs it on
+    // all layers, runs forward-only PPL over CP_EVAL_WINDOWS, and prints "PPL <val>"
+    // to stdout. Avoids reloading the model per candidate (~2560 candidates/search).
+    // The Python GA feeds paths on stdin and reads PPL back. Requires CP_SIZE=1.
+    if (std::getenv("CP_LONGROPE_SEARCH") && std::atoi(std::getenv("CP_LONGROPE_SEARCH")) != 0) {
+        if (cp_size != 1) die("CP_LONGROPE_SEARCH requires NP=1 / CP_SIZE=1");
+        const int     Tpos = static_cast<int>(cfg.T);
+        const int64_t V    = cfg.vocab_size;
+        const int     n_windows = static_cast<int>(env_i64("CP_EVAL_WINDOWS", 5));
+        const int64_t half = cfg.head_dim / 2;
+        if (is_master)
+            std::cerr << "[longrope-search] resident evaluator ready: T=" << Tpos
+                      << " windows=" << n_windows
+                      << " (feed candidate factor-file paths on stdin; 'PPL <v>' per line back)\n";
+        std::string path;
+        while (std::getline(std::cin, path)) {
+            if (path.empty()) continue;
+            std::vector<float> lam; int64_t nhat = 0; int s_ = 0; int64_t slen = 0;
+            try { parse_longrope_factors(path, half, lam, nhat, s_, slen); }
+            catch (const std::exception& ex) {
+                if (is_master) std::cout << "ERR " << ex.what() << std::endl << std::flush;
+                continue;
+            }
+            // Rebuild only the cache (cheap CPU loop) and swap it onto every layer.
+            Tensor lr = autograd::build_rope_cache_longrope(
+                cfg.T, cfg.head_dim, static_cast<float>(cfg.rope_theta), lam, nhat, device);
+            for (auto& a : model.attn) a->cp_->set_rope_cache(lr);
+
+            double tot_nll = 0.0; long long tot_cnt = 0;
+            {
+                autograd::NoGradGuard no_grad;
+                val_loader.reset();
+                for (int w = 0; w < n_windows; ++w) {
+                    Batch b = val_loader.next_batch();
+                    ShardedInputs shy = shard_targets(b.input, b.target);
+                    Tensor logits = model.forward(b.input);
+                    Tensor logits_cpu = logits.as_type(Dtype::Float32).to_cpu();
+                    const float* lp = logits_cpu.data<float>();
+                    Tensor y_cpu = shy.y_local.to_cpu();
+                    const Dtype ydt = y_cpu.dtype();
+                    const uint16_t* yp16 = (ydt == Dtype::UInt16) ? y_cpu.data<uint16_t>() : nullptr;
+                    const int32_t*  yp32 = (ydt == Dtype::Int32)  ? y_cpu.data<int32_t>()  : nullptr;
+                    const int64_t*  yp64 = (ydt == Dtype::Int64)  ? y_cpu.data<int64_t>()  : nullptr;
+                    const int Bcur = static_cast<int>(cfg.B);
+                    for (int t = 0; t < Tpos; ++t)
+                        for (int bi = 0; bi < Bcur; ++bi) {
+                            const size_t idx = static_cast<size_t>(bi) * Tpos + t;
+                            const float* row = lp + idx * V;
+                            float mx = row[0];
+                            for (int64_t v = 1; v < V; ++v) if (row[v] > mx) mx = row[v];
+                            double se = 0.0;
+                            for (int64_t v = 0; v < V; ++v) se += std::exp(static_cast<double>(row[v] - mx));
+                            const double lse = static_cast<double>(mx) + std::log(se);
+                            const int64_t tgt = yp16 ? static_cast<int64_t>(yp16[idx])
+                                               : yp64 ? yp64[idx]
+                                                      : static_cast<int64_t>(yp32[idx]);
+                            if (tgt < 0 || tgt >= V) continue;
+                            tot_nll += lse - static_cast<double>(row[tgt]);
+                            tot_cnt += 1;
+                        }
+                }
+            }
+            const double mean_nll = tot_cnt > 0 ? tot_nll / static_cast<double>(tot_cnt) : 0.0;
+            if (is_master)
+                std::cout << "PPL " << std::setprecision(8) << std::exp(mean_nll)
+                          << std::endl << std::flush;
+        }
+        MPI_Finalize();
+        return 0;
+    }
+
     if (eval_ppl_mode) {
         if (cp_size != 1)
             throw std::runtime_error(

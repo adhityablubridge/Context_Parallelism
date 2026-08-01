@@ -9,10 +9,21 @@
       "Bash(awk 'END{print substr\\($0, length\\($0\\)-70\\)}' \"Claude Logs.md\")",
       "Bash(awk 'END{print substr\\($0, length\\($0\\)-55\\)}' \"Claude Logs.md\")",
       "WebSearch",
-      "WebFetch(domain:arxiv.org)"
+      "WebFetch(domain:arxiv.org)",
+      "Bash(make CP_FUSED_ROPE=1 cp-rope-longrope)",
+      "Bash(make CP_FUSED_ROPE=1 bluscript-cp)",
+      "Bash(tee /tmp/lr_build1.log)",
+      "Bash(tee /tmp/lr_build2.log)",
+      "Read(//home/blu-bridge25/Downloads/**)",
+      "Bash(nvidia-smi -L)",
+      "Bash(nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv)",
+      "Bash(nvidia-smi --query-compute-apps=pid,used_memory --format=csv)",
+      "Bash(date '+%Y-%m-%d %H:%M'; echo \"---\"; tail -1 \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\" | cut -c1-90)",
+      "Bash(cat >> *)"
     ],
     "additionalDirectories": [
-      "/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault"
+      "/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault",
+      "/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Reports"
     ]
   }
 }

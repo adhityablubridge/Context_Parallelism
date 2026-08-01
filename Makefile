@@ -319,6 +319,26 @@ run-cream-cache-parity: $(CREAM_EXE)
 	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
 	    ./$(CREAM_EXE) $(ARGS)
 
+# ---- LongRoPE cache builder parity (CPU value checks; links libtensor). ---------
+# Build: make cp-rope-longrope   Run: make run-cp-rope-longrope
+LONGROPE_SRC := Tests/cp_rope_longrope_parity.cpp
+LONGROPE_OBJ := $(OBJDIR)/Tests/cp_rope_longrope_parity.o
+LONGROPE_EXE := $(BINDIR)/cp_rope_longrope_parity_exec
+.PHONY: cp-rope-longrope run-cp-rope-longrope
+cp-rope-longrope: $(LONGROPE_EXE)
+$(LONGROPE_EXE): $(LONGROPE_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) | $(TENSOR_LIB_A) $(PROFILER_LIB)
+	@mkdir -p $(BINDIR)
+	@echo -e "\n--- Linking LongRoPE parity test (sm_$(SM_ARCH)): $@"
+	$(NVCC) $(LINKFLAGS) $(LDFLAGS) -o $@ \
+	        $(LONGROPE_OBJ) $(OBJECTS_FROM_CPP) $(OBJECTS_FROM_CU) \
+	        -Xlinker --start-group $(TENSOR_LIB_A) -Xlinker --end-group \
+	        $(LDLIBS) $(LINK_MEMFLAGS)
+
+run-cp-rope-longrope: $(LONGROPE_EXE)
+	@echo "--- Running LongRoPE cache parity ---"
+	LD_LIBRARY_PATH=$(TENSOR_LIBDIR):$(PROFILER_LIBDIR):$$LD_LIBRARY_PATH \
+	    ./$(LONGROPE_EXE) $(ARGS)
+
 # ---- bluscriptCP: context-parallel Llama training (DataParallel + ContextParallel
 #      on the unified PG). Ring path needs CP_FUSED_ROPE=1.
 # Build: make CP_FUSED_ROPE=1 bluscript-cp    Run: make CP_FUSED_ROPE=1 run-bluscript-cp NP=2

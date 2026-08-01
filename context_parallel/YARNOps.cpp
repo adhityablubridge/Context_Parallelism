@@ -15,6 +15,8 @@
 #include "CPLog.h"    // cplog::log_rank() — gate one-time notices to rank 0
 #include <string>    // std::to_string
 #include <algorithm> // std::max, std::min
+#include <vector>    // std::vector (LongRoPE lambda)
+#include "context_parallel/LongRoPEOps.h"  // build_rope_cache_longrope declaration
 
 namespace OwnTensor {
 namespace autograd {
@@ -119,6 +121,76 @@ Tensor build_rope_cache(int64_t seq_len, int64_t head_dim, float base, DeviceInd
             float angle = static_cast<float>(pos) * inv_freq;
             p[pos * head_dim + i]        = std::cos(angle) * m;  // bake temperature m
             p[pos * head_dim + i + half] = std::sin(angle) * m;
+        }
+    }
+
+    cpu.set_requires_grad(false);
+    if (device.device == Device::CUDA) {
+        Tensor cache = cpu.to(device);
+        cache.set_requires_grad(false);
+        return cache;
+    }
+    return cpu;
+}
+
+// ============================================================================
+// build_rope_cache_longrope — LongRoPE (searched per-dim lambda + n_hat) cache.
+//
+// angle(n,i) = n * base_freq_i / (n < n_hat ? 1 : lambda_i). NeoX half-split
+// layout identical to build_rope_cache above (cos in [0,half), sin in
+// [half,head_dim)). NO YaRN attention-temperature m. lambda has length
+// head_dim/2, monotone non-decreasing, each >= 1 (the search enforces this; we
+// re-assert defensively). Built on CPU fp32 then copied to device, grad-free.
+// New, additive symbol -- does not touch build_rope_cache or any caller.
+// ============================================================================
+Tensor build_rope_cache_longrope(int64_t seq_len, int64_t head_dim, float base,
+                                 const std::vector<float>& lambda, int64_t n_hat,
+                                 DeviceIndex device)
+{
+    if (head_dim % 2 != 0) {
+        throw std::invalid_argument("build_rope_cache_longrope: head_dim must be even");
+    }
+    const int64_t half = head_dim / 2;
+    if (static_cast<int64_t>(lambda.size()) != half) {
+        throw std::invalid_argument(
+            "build_rope_cache_longrope: lambda size (" + std::to_string(lambda.size()) +
+            ") must equal head_dim/2 (" + std::to_string(half) + ")");
+    }
+    for (int64_t i = 0; i < half; ++i) {
+        if (!(lambda[static_cast<size_t>(i)] >= 1.0f)) {
+            throw std::invalid_argument(
+                "build_rope_cache_longrope: lambda[" + std::to_string(i) + "] must be >= 1");
+        }
+        if (i > 0 && lambda[static_cast<size_t>(i)] < lambda[static_cast<size_t>(i - 1)]) {
+            throw std::invalid_argument(
+                "build_rope_cache_longrope: lambda must be non-decreasing (violated at i=" +
+                std::to_string(i) + ")");
+        }
+    }
+    if (n_hat < 0) {
+        throw std::invalid_argument("build_rope_cache_longrope: n_hat must be >= 0");
+    }
+
+    if (cplog::log_rank()) std::fprintf(stderr,
+        "[LongRoPE] build_rope_cache_longrope: seq_len=%lld hd=%lld n_hat=%lld "
+        "lam0=%.4f lam_last=%.4f\n",
+        (long long)seq_len, (long long)head_dim, (long long)n_hat,
+        (double)lambda[0], (double)lambda[static_cast<size_t>(half - 1)]);
+
+    TensorOptions cpu_opts = TensorOptions().with_dtype(Dtype::Float32)
+                                            .with_device(DeviceIndex(Device::CPU));
+    Tensor cpu(Shape{{seq_len, head_dim}}, cpu_opts);
+    float* p = cpu.data<float>();
+
+    for (int64_t pos = 0; pos < seq_len; ++pos) {
+        const bool preserved = (pos < n_hat);   // initial tokens keep original positions
+        for (int64_t i = 0; i < half; ++i) {
+            float exponent  = (2.0f * static_cast<float>(i)) / static_cast<float>(head_dim);
+            float base_freq = 1.0f / std::pow(base, exponent);
+            float scale     = preserved ? 1.0f : lambda[static_cast<size_t>(i)];  // lambda divides freq
+            float angle     = static_cast<float>(pos) * base_freq / scale;
+            p[pos * head_dim + i]        = std::cos(angle);   // NeoX half-split, NO m temperature
+            p[pos * head_dim + i + half] = std::sin(angle);
         }
     }
 

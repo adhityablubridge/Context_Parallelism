@@ -327,6 +327,35 @@ CP_CKPT_RESUME=<base_run> CP_MAX_STEPS=<target> CP_REWARMUP=<W> CP_REWARMUP_PEAK
     make CP_FUSED_ROPE=1 run-bluscript-cp NP=1
 ```
 
+**LongRoPE searched-cache context extension** (`CP_LONGROPE_FACTORS`)
+
+LongRoPE (Ding et al. 2024, arXiv:2402.13753) reparametrizes RoPE with a **searched** per-dimension rescale vector `λ` (length `head_dim/2`) plus an initial-token threshold `n̂`: `angle(n,i) = n·base_freq_i / (n<n̂ ? 1 : λ_i)`. Unlike YaRN it uses no attention-temperature `m`. The cache builder is [context_parallel/LongRoPEOps.h](context_parallel/LongRoPEOps.h) (`build_rope_cache_longrope`); the layout matches the YaRN cache so the fused kernel indexes it identically. `CP_LONGROPE_FACTORS` unset ⇒ byte-identical to today.
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `CP_LONGROPE_FACTORS` | – | Path to a factors file. When set, builds the LongRoPE cache. **Alone** (no CREAM): installed directly on all layers at `CP_T`. **Composed with `CP_CREAM_MODE≠off`**: becomes CREAM's gather source (built at `cream_scaled_max`). |
+| `CP_LONGROPE_SEARCH` | – | `1` runs the **resident search evaluator**: loads the model once, then reads candidate factor-file paths on stdin, rebuilds only the cache per candidate, and prints `PPL <v>` per line. Used by the GA driver. |
+
+**Factors file format** (whitespace-separated, keys any order; `#` starts a comment):
+```
+n_hat 8
+s 4
+S_search 16384
+lambda 1.00 1.00 1.05 ... (head_dim/2 monotone-nondecreasing values ≥ 1)
+```
+
+**Composition coupling (asserted at startup):** when composed with CREAM, `S_search` must equal `cream_scaled_max` (`= factor·CP_T`) and the file's `s` must equal `factor` — the searched cache has to be as long as, and tuned for, the length CREAM's tail labels reach. Mismatch ⇒ the run dies with a clear message.
+
+**The search** (`Tests/bluscriptcp/longrope_search.py`) is an evolutionary GA (P=64, 40 iters, per-dim resample at p=0.3, monotone-repair via running-max, PI/NTK/YaRN seeds) using the resident evaluator as the PPL fitness. Example:
+```bash
+python3 Tests/bluscriptcp/longrope_search.py --exec ./build/bluscriptCP_exec \
+    --ckpt-run <run> --target-t 16384 --s 4 --head-dim 64 --orig-maxpos 4096 \
+    --data-root $HOME/Downloads --cuda-devices 0 --calib-windows 5 \
+    --arch "CP_SIZE=1 CP_N_EMBD=384 CP_N_LAYER=6 CP_N_HEAD=6 CP_N_KVHEAD=2 CP_FFN=1024 CP_WEIGHT_TYING=0" \
+    --pop 64 --iters 40 --out longrope_best.txt
+```
+Then fine-tune / eval with `CP_LONGROPE_FACTORS=longrope_best.txt` (compose with CREAM for cheap 4k-physical fine-tuning). Parity: `make CP_FUSED_ROPE=1 cp-rope-longrope`.
+
 **Diagnostics (ring) + device mapping**
 
 | Var | Effect |
