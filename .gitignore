@@ -29,10 +29,17 @@ mem_scaling_runs_bluscriptcp/
 mem_scaling_runs_hybrid/
 1step*.csv
 debug_rank_*.md
+*.png
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
 
 # Editor / OS
 *.swp
 .DS_Store
+.~lock.*#
 
 # Externally-maintained dependencies -- NOT part of the CP repo.
 # BluTrain bundles Tensor-Implementations (libtensor) + Profiler (libprofiler);
