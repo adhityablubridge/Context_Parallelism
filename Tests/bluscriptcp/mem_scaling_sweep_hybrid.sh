@@ -39,7 +39,7 @@ set -u  # (no -e: we WANT to continue after an OOM run fails)
 # ============================ EDIT THIS BLOCK ================================
 
 # Which GPUs to use. world_size = number of devices listed here.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 # Build the C++ binary once before sweeping (1=yes). Set 0 if already built.
 BUILD_CPP="${BUILD_CPP:-1}"
@@ -58,7 +58,7 @@ DATA_ROOT="${CP_DATA_ROOT:-${REPO_ROOT}/Data_Loader/Data}"
 NO_GPUS_PER_NODE_ENV="${NO_GPUS_PER_NODE:-}"
 
 # Output: per-run snapshots + the results CSV.
-OUT_DIR="${SCRIPT_DIR}/mem_scaling_runs_hybrid"
+OUT_DIR="${SCRIPT_DIR}/mem_scaling_runs_hybrid_ws8"
 
 # T sweep: start, doubling, with a hard cap so it cannot loop forever.
 T_START="${T_START:-2048}"
@@ -83,15 +83,23 @@ CP_ROTATOR_ENV="${CP_ROTATOR:-p2p}"
 # Topology matrix: "RING ULYSSES RING_OUTER".  CP_SIZE = RING*ULYSSES.
 # Rows are auto-skipped when RING*ULYSSES does not divide world_size, or when
 # ULYSSES does not divide the model's q_heads/kv_heads.
+# TOPOLOGIES=(
+#   "1 2 0"   # pure Ulysses (CP_SIZE=2)
+#   "2 1 0"   # pure Ring    (CP_SIZE=2)
+#   "2 2 0"   # hybrid 2x2   (CP_SIZE=4)   [4GPU: dp1 | 8GPU: dp2]
+#   "2 2 1"   # hybrid 2x2, RING-OUTER (ring across NUMA)  [8GPU: dp2]
+#   "2 4 0"   # hybrid 2x4   (CP_SIZE=8)   [8GPU: dp1]  (needs ulysses|q,kv -> wide-head cfg)
+#   "4 2 0"   # hybrid 4x2   (CP_SIZE=8)   [8GPU: dp1]  (ring degree 4)
+#   "4 1 0"   # pure Ring 4  (CP_SIZE=4)
+#   "8 1 0"   # pure Ring 8  (CP_SIZE=8)
+# )
+
 TOPOLOGIES=(
-  "1 2 0"   # pure Ulysses (CP_SIZE=2)
-  "2 1 0"   # pure Ring    (CP_SIZE=2)
-  "2 2 0"   # hybrid 2x2   (CP_SIZE=4)   [4GPU: dp1 | 8GPU: dp2]
-  "2 2 1"   # hybrid 2x2, RING-OUTER (ring across NUMA)  [8GPU: dp2]
-  "2 4 0"   # hybrid 2x4   (CP_SIZE=8)   [8GPU: dp1]  (needs ulysses|q,kv -> wide-head cfg)
-  "4 2 0"   # hybrid 4x2   (CP_SIZE=8)   [8GPU: dp1]  (ring degree 4)
-  "4 1 0"   # pure Ring 4  (CP_SIZE=4)
-  "8 1 0"   # pure Ring 8  (CP_SIZE=8)
+  "2 4 0"   # CP8, dp1
+  "4 2 0"   # CP8, dp1
+  "8 1 0"   # CP8, dp1
+  "2 2 0"   # CP4, dp2  <-- DP=2 x hybrid (new *combination*; memory = ws4 r2u2)
+  "2 2 1"   # CP4, dp2  <-- same, ring-outer mesh (NUMA placement)
 )
 
 # Model config matrix: "LABEL D_MODEL N_LAYER Q_HEADS KV_HEADS FFN TYING".
