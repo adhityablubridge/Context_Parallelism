@@ -18,6 +18,10 @@ Data_Loader/Edufineweb_numpy/
 *.ckpt
 # Run outputs: AllocationTracker CSVs, training logs, per-rank debug dumps
 *.csv
+*.log
+**/logs/
+nohup.out
+longrope_best.txt
 CP_Training_logs/
 CP_GPT2_Training_logs/
 CP_BluScreipt_Training_logs/
