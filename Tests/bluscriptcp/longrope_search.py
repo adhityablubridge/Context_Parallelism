@@ -148,10 +148,21 @@ class Evaluator:
                                   "BluTrain/Profiler/lib:" + ld)
         # single rank via mpirun for the CP process-group init
         cmd = ["mpirun", "-np", "1", args.exec]
-        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  env=env, text=True, bufsize=1)
         self.tmp = tempfile.mkdtemp(prefix="lrsearch_")
+        # capture the evaluator's stderr so we can surface the REAL error on death
+        self.errpath = os.path.join(self.tmp, "evaluator.stderr")
+        self.errfile = open(self.errpath, "w+")
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=self.errfile, env=env, text=True, bufsize=1)
         self._n = 0
+
+    def _stderr_tail(self, n=30):
+        try:
+            self.errfile.flush()
+            with open(self.errpath) as f:
+                return "".join(f.readlines()[-n:])
+        except Exception:
+            return "(could not read evaluator stderr)"
 
     def eval(self, lam, nhat, s, search_len):
         path = os.path.join(self.tmp, f"cand_{self._n}.txt")
@@ -163,7 +174,7 @@ class Evaluator:
         while True:
             line = self.p.stdout.readline()
             if not line:
-                raise RuntimeError("resident evaluator died")
+                raise RuntimeError("resident evaluator died. stderr tail:\n" + self._stderr_tail())
             line = line.strip()
             if line.startswith("PPL "):
                 return float(line.split()[1])

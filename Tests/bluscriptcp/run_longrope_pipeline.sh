@@ -28,7 +28,7 @@ HEAD_DIM=${HEAD_DIM:-64}
 ORIG_MAXPOS=${ORIG_MAXPOS:-$PHYS_T}
 DATA_ROOT=${DATA_ROOT:-/home/blu-bridge25/CP/Data_Loader/Data}   # clean shard dir (15 train + val)
 GPU=${GPU:-0}
-FT_RUN=${FT_RUN:-200}            # run number for the fine-tuned checkpoint
+FT_RUN=${FT_RUN:-80}             # start numbering new fine-tuned checkpoints here (auto-increments if taken)
 FT_STEPS=${FT_STEPS:-300}        # fine-tune steps on top of base
 FT_B=${FT_B:-1}                  # micro-batch for the fine-tune (1 for long-physical alone)
 EVAL_WINDOWS=${EVAL_WINDOWS:-32}
@@ -103,9 +103,12 @@ if [ "$COMPOSE" = "none" ]; then
   log "COMPOSE=none: skipping fine-tune -- will eval the BASE ckpt (run $BASE_RUN) with the searched cache"
   EVAL_RUN=$BASE_RUN
 else
-  if ls "$CKPT_DIR"/${PREFIX}_run${FT_RUN}_* >/dev/null 2>&1; then
-    log "ERROR: run $FT_RUN already exists in $CKPT_DIR -- set FT_RUN to a free number"; exit 1
-  fi
+  # never overwrite an existing checkpoint: bump FT_RUN to the first free run number
+  # (>= the starting value, default 80). Also avoids colliding with the base run.
+  while ls "$CKPT_DIR"/${PREFIX}_run${FT_RUN}_* >/dev/null 2>&1 || [ "$FT_RUN" = "$BASE_RUN" ]; do
+    FT_RUN=$(( FT_RUN + 1 ))
+  done
+  log "fine-tuned checkpoint will be run $FT_RUN (first free >= start)"
   log "branching base run $BASE_RUN -> $FT_RUN"
   for f in "$CKPT_DIR"/${PREFIX}_run${BASE_RUN}_*; do cp "$f" "${f/run${BASE_RUN}/run${FT_RUN}}"; done
   FT_MAX=$(( BASE_MAX_STEPS + FT_STEPS ))
