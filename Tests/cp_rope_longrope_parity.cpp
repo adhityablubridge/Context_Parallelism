@@ -103,6 +103,22 @@ int main() {
         gate(t1 && t2 && t3, "guards throw (mono / size / lambda>=1)", 0.0);
     }
 
+    // ---- E. mscale: lambda=1, n_hat=0, mscale=M -> plain RoPE * M (YaRN-temp knob) ----
+    {
+        const double M = 1.5;
+        std::vector<float> lam(half, 1.0f);
+        Tensor lr = autograd::build_rope_cache_longrope(T, HD, BASE, lam, /*n_hat=*/0, cpu, (float)M);
+        const float* a = lr.data<float>();
+        double m = 0.0;
+        for (int64_t pos = 0; pos < T; ++pos)
+            for (int64_t i = 0; i < half; ++i) {
+                double c, si; ref_row(BASE, HD, pos, i, 1.0, /*n_hat=*/0, c, si);
+                m = std::max(m, (double)std::abs(a[pos*HD + i]        - c  * M));
+                m = std::max(m, (double)std::abs(a[pos*HD + i + half] - si * M));
+            }
+        gate(m < 1e-5, "mscale=1.5 == plain RoPE * mscale", m);
+    }
+
     if (g_fail == 0) { std::printf("\nALL cp_rope_longrope parity tests passed.\n"); return 0; }
     std::printf("\n%d cp_rope_longrope test(s) FAILED.\n", g_fail);
     return 1;

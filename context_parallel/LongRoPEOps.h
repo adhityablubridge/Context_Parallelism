@@ -25,9 +25,13 @@
 namespace OwnTensor {
 namespace autograd {
 
+// `mscale` (default 1.0 = paper-faithful LongRoPE, NO temperature) optionally
+// bakes YaRN's attention-temperature into cos/sin (cos*mscale, sin*mscale) so a
+// LongRoPE+m hybrid can be compared apples-to-apples against YaRN (which uses
+// m = 0.1*ln(s)+1). mscale=1.0 leaves the paper behavior unchanged.
 Tensor build_rope_cache_longrope(int64_t seq_len, int64_t head_dim, float base,
                                  const std::vector<float>& lambda, int64_t n_hat,
-                                 DeviceIndex device);
+                                 DeviceIndex device, float mscale = 1.0f);
 
 }  // namespace autograd
 }  // namespace OwnTensor

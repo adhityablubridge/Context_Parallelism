@@ -145,7 +145,7 @@ Tensor build_rope_cache(int64_t seq_len, int64_t head_dim, float base, DeviceInd
 // ============================================================================
 Tensor build_rope_cache_longrope(int64_t seq_len, int64_t head_dim, float base,
                                  const std::vector<float>& lambda, int64_t n_hat,
-                                 DeviceIndex device)
+                                 DeviceIndex device, float mscale)
 {
     if (head_dim % 2 != 0) {
         throw std::invalid_argument("build_rope_cache_longrope: head_dim must be even");
@@ -173,9 +173,9 @@ Tensor build_rope_cache_longrope(int64_t seq_len, int64_t head_dim, float base,
 
     if (cplog::log_rank()) std::fprintf(stderr,
         "[LongRoPE] build_rope_cache_longrope: seq_len=%lld hd=%lld n_hat=%lld "
-        "lam0=%.4f lam_last=%.4f\n",
+        "lam0=%.4f lam_last=%.4f mscale=%.4f\n",
         (long long)seq_len, (long long)head_dim, (long long)n_hat,
-        (double)lambda[0], (double)lambda[static_cast<size_t>(half - 1)]);
+        (double)lambda[0], (double)lambda[static_cast<size_t>(half - 1)], (double)mscale);
 
     TensorOptions cpu_opts = TensorOptions().with_dtype(Dtype::Float32)
                                             .with_device(DeviceIndex(Device::CPU));
@@ -189,8 +189,8 @@ Tensor build_rope_cache_longrope(int64_t seq_len, int64_t head_dim, float base,
             float base_freq = 1.0f / std::pow(base, exponent);
             float scale     = preserved ? 1.0f : lambda[static_cast<size_t>(i)];  // lambda divides freq
             float angle     = static_cast<float>(pos) * base_freq / scale;
-            p[pos * head_dim + i]        = std::cos(angle);   // NeoX half-split, NO m temperature
-            p[pos * head_dim + i + half] = std::sin(angle);
+            p[pos * head_dim + i]        = std::cos(angle) * mscale;   // NeoX half-split; mscale=1 => no temp
+            p[pos * head_dim + i + half] = std::sin(angle) * mscale;
         }
     }
 

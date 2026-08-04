@@ -148,10 +148,14 @@ public:
     const int64_t T_local_bwd = saved_q_.shape().dims[seq_dim];
 
     Tensor grad_q = Tensor::zeros(saved_q_.shape(), saved_q_.opts());
+    // dK/dV accumulators MUST stay fp32 even when saved-K/V is bf16 (CP_SAVE_KV_BF16):
+    // they accumulate gradient contributions across ring hops, and bf16 there loses mantissa
+    // on every cross-rank add. Decouple grad dtype from the saved-storage dtype (only dtype
+    // changes; device/req_grad preserved). Derived transports (dkv_send, :263/595) follow.
     Tensor grad_key = Tensor::zeros(
-        saved_k_chunks_[0].shape(), saved_k_chunks_[0].opts());
+        saved_k_chunks_[0].shape(), saved_k_chunks_[0].opts().with_dtype(Dtype::Float32));
     Tensor grad_value = Tensor::zeros(
-        saved_v_chunks_[0].shape(), saved_v_chunks_[0].opts());
+        saved_v_chunks_[0].shape(), saved_v_chunks_[0].opts().with_dtype(Dtype::Float32));
 
     // RoPE QK-norm gamma grad accumulators (additive; only used when use_rope_).
     // Replicated-parameter grads: accumulated LOCALLY over ring steps (NO
@@ -224,6 +228,11 @@ public:
       kv_rotater = create_rotator();
       curr_k = saved_k_chunks_[0];
       curr_v = saved_v_chunks_[0];
+      // CP_SAVE_KV_BF16: the seed is bf16 -> upcast to fp32 for the fp32-boundary backward op
+      // AND the recompute ring (keeps s_kv_send + its sizeof(float) pack fp32, regardless of
+      // CP_RING_BF16). Guarded so an already-fp32 tensor is untouched (byte-identical fallback).
+      if (curr_k.is_valid() && curr_k.dtype() == Dtype::Bfloat16) curr_k = curr_k.as_type(Dtype::Float32);
+      if (curr_v.is_valid() && curr_v.dtype() == Dtype::Bfloat16) curr_v = curr_v.as_type(Dtype::Float32);
       int64_t need = curr_k.numel() * 2;
       if (s_kv_send_numel < need) {
         for (int s = 0; s < 2; ++s)
@@ -304,6 +313,13 @@ public:
       // If this step was skipped in forward (invalid K/V), skip SDPA but
       // still participate in dkv_rotater communication below.
       bool step_skipped = !step_k.is_valid();
+
+      // CP_SAVE_KV_BF16: upcast bf16 saved K/V to fp32 for the fp32-boundary backward op.
+      // AFTER the validity check (skipped steps store an invalid tensor); no-op when fp32.
+      if (!step_skipped && step_k.dtype() == Dtype::Bfloat16) {
+        step_k = step_k.as_type(Dtype::Float32);
+        step_v = step_v.as_type(Dtype::Float32);
+      }
 
       bool use_causal = saved_causal_flags_[i];
       bool use_partial = saved_partial_flags_[i];
@@ -665,8 +681,10 @@ public:
         size_t k_bytes = static_cast<size_t>(k_numel) * sizeof(float);
 
         // Pack K+V into one send buffer
+        // fp32 grad transport even when saved-K/V is bf16 (the sizeof(float) packs below + the
+        // sendrecv dtype must all agree on fp32; bf16 here would corrupt the grad ring).
         Tensor send_buf = Tensor::zeros(Shape({{k_numel * 2}}),
-                                        saved_k_chunks_[0].opts());
+                                        saved_k_chunks_[0].opts().with_dtype(Dtype::Float32));
         if (grad_k_accum[i].is_valid()) {
           cudaMemcpyAsync(send_buf.data<float>(), grad_k_accum[i].data<float>(),
                           k_bytes, cudaMemcpyDeviceToDevice, 0);
@@ -676,14 +694,14 @@ public:
         }
 
         Tensor recv_buf = Tensor::empty(Shape({{k_numel * 2}}),
-                                        saved_k_chunks_[0].opts());
+                                        saved_k_chunks_[0].opts().with_dtype(Dtype::Float32));
 
         // Single packed sendrecv
         nvtxRangePushA("CP.bwd.nonLB.sendrecv");
         pg_->sendrecv(send_buf.data<float>(), recv_buf.data<float>(),
                       source_rank, dest_rank,
                       static_cast<size_t>(k_numel * 2),
-                      saved_k_chunks_[0].dtype(), true);
+                      Dtype::Float32, true);   // fp32 grad transport (buffers are fp32)
         nvtxRangePop();
 
         // Unpack and accumulate
@@ -713,9 +731,13 @@ public:
     if (grad_q.dtype() != saved_q_.dtype()) {
       grad_q = grad_q.as_type(saved_q_.dtype());
     }
-    if (grad_key.dtype() != saved_k_chunks_[0].dtype()) {
-      grad_key = grad_key.as_type(saved_k_chunks_[0].dtype());
-      grad_value = grad_value.as_type(saved_v_chunks_[0].dtype());
+    // Activation grads target the TRUE activation dtype (fp32), NOT the saved-STORAGE dtype
+    // (bf16 under CP_SAVE_KV_BF16). saved_q_ is always fp32 (Q is untouched by any flag), so key
+    // on it -> grad_key/grad_value stay fp32, matching the upstream K/V-projection backward.
+    // When the flag is off (saved-K/V fp32) this is identical to the old behavior.
+    if (grad_key.dtype() != saved_q_.dtype()) {
+      grad_key = grad_key.as_type(saved_q_.dtype());
+      grad_value = grad_value.as_type(saved_q_.dtype());
     }
 
     // Optional backward parity probe (gated by DUMP_CP_OUT=1).

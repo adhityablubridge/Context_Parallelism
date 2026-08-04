@@ -157,6 +157,8 @@ struct ModelConfig {
     int64_t            longrope_n_hat      = 0;            // initial-token threshold
     int                longrope_s          = 0;           // extension ratio recorded in file
     int64_t            longrope_search_len = 0;           // S_search recorded in file
+    float              longrope_mscale     = 1.0f;         // CP_LONGROPE_MSCALE: 1.0=paper (no temp),
+                                                           // else YaRN m=0.1*ln(s)+1 baked in (fair-vs-YaRN)
 
     // ---- checkpointing ----
     bool        checkpointing = true;
@@ -382,7 +384,7 @@ public:
                 // cream_scaled_max; coupling asserted in main). Replaces the YaRN source.
                 cream_full_cache_ = autograd::build_rope_cache_longrope(
                     c.cream_scaled_max, c.head_dim, static_cast<float>(c.rope_theta),
-                    c.longrope_lambda, c.longrope_n_hat, dev);
+                    c.longrope_lambda, c.longrope_n_hat, dev, c.longrope_mscale);
             } else {
                 cream_full_cache_ = autograd::build_rope_cache(
                     c.cream_scaled_max, c.head_dim,
@@ -417,7 +419,7 @@ public:
         if (!c.longrope_factors.empty() && c.cream_mode == "off") {
             Tensor lr = autograd::build_rope_cache_longrope(
                 c.context_length, c.head_dim, static_cast<float>(c.rope_theta),
-                c.longrope_lambda, c.longrope_n_hat, dev);
+                c.longrope_lambda, c.longrope_n_hat, dev, c.longrope_mscale);
             for (auto& a : attn) a->cp_->set_rope_cache(lr);
         }
     }
@@ -737,6 +739,16 @@ int main(int argc, char** argv) {
             parse_longrope_factors(cfg.longrope_factors, half, cfg.longrope_lambda,
                                    cfg.longrope_n_hat, cfg.longrope_s, cfg.longrope_search_len);
         } catch (const std::exception& ex) { die(ex.what()); }
+        // CP_LONGROPE_MSCALE=1 bakes YaRN's attention temperature m=0.1*ln(s)+1 into
+        // the LongRoPE cache (a LongRoPE+m hybrid) for an apples-to-apples fight with
+        // YaRN. Default off => paper-faithful LongRoPE (mscale=1, no temperature).
+        if (std::getenv("CP_LONGROPE_MSCALE") && std::atoi(std::getenv("CP_LONGROPE_MSCALE")) != 0) {
+            cfg.longrope_mscale = (cfg.longrope_s > 1)
+                ? (0.1f * std::log(static_cast<float>(cfg.longrope_s)) + 1.0f) : 1.0f;
+            if (is_master)
+                std::cout << "[LongRoPE] mscale ON: m=" << cfg.longrope_mscale
+                          << " (YaRN temperature baked in)" << std::endl;
+        }
         if (cream_on) {
             // Composition coupling: CREAM's tail labels reach cream_scaled_max, so the
             // LongRoPE gather source must be that long AND tuned for that target.
@@ -1354,6 +1366,10 @@ int main(int argc, char** argv) {
         const int64_t V    = cfg.vocab_size;
         const int     n_windows = static_cast<int>(env_i64("CP_EVAL_WINDOWS", 5));
         const int64_t half = cfg.head_dim / 2;
+        // If CP_LONGROPE_MSCALE is set, bake YaRN's temperature into every candidate's
+        // cache (fair-vs-YaRN search). m is per-candidate from the file's s (below).
+        const bool    lr_mscale_on = std::getenv("CP_LONGROPE_MSCALE")
+                                     && std::atoi(std::getenv("CP_LONGROPE_MSCALE")) != 0;
         if (is_master)
             std::cerr << "[longrope-search] resident evaluator ready: T=" << Tpos
                       << " windows=" << n_windows
@@ -1368,8 +1384,10 @@ int main(int argc, char** argv) {
                 continue;
             }
             // Rebuild only the cache (cheap CPU loop) and swap it onto every layer.
+            const float cand_mscale = (lr_mscale_on && s_ > 1)
+                ? (0.1f * std::log(static_cast<float>(s_)) + 1.0f) : 1.0f;
             Tensor lr = autograd::build_rope_cache_longrope(
-                cfg.T, cfg.head_dim, static_cast<float>(cfg.rope_theta), lam, nhat, device);
+                cfg.T, cfg.head_dim, static_cast<float>(cfg.rope_theta), lam, nhat, device, cand_mscale);
             for (auto& a : model.attn) a->cp_->set_rope_cache(lr);
 
             double tot_nll = 0.0; long long tot_cnt = 0;

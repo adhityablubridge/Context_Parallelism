@@ -37,6 +37,12 @@ EVAL_WINDOWS=${EVAL_WINDOWS:-32}
 #   cream : LongRoPE cache as CREAM gather source, fine-tune at 4k physical (cheap)
 #   none  : NO fine-tune -- eval the base ckpt directly with the searched cache (search-only)
 COMPOSE=${COMPOSE:-alone}
+# MSCALE=1 bakes YaRN's attention temperature (m=0.1*ln(s)+1) into the LongRoPE
+# cache -> a LongRoPE+m hybrid for an apples-to-apples fight vs YaRN. 0 = paper-
+# faithful (no temperature). Applied consistently across search + fine-tune + eval.
+MSCALE=${MSCALE:-0}
+[ "$MSCALE" = "1" ] && ARCH="$ARCH CP_LONGROPE_MSCALE=1"
+MTAG=""; [ "$MSCALE" = "1" ] && MTAG="_m"
 # search knobs -- RIGHT-SIZED for this model, not the paper's 7B/512x scale.
 # head_dim/2 search dims (32 here) + PI/NTK/YaRN seeds converge fast, so a small
 # GA with EARLY-STOPPING runs only as much as the model needs. PATIENCE stops when
@@ -131,7 +137,7 @@ else
 fi
 
 # ---- 4. eval the LongRoPE arm at the target length --------------------------
-OUT=ppl_longrope_x${S}_${COMPOSE}.csv
+OUT=ppl_longrope_x${S}_${COMPOSE}${MTAG}.csv
 log "eval PPL-vs-position at T=$TARGET_T (run $EVAL_RUN) -> $OUT"
 run_bin $ARCH CP_EVAL_PPL=1 CP_T=$TARGET_T CP_B=1 CP_EVAL_WINDOWS=$EVAL_WINDOWS \
     CP_LONGROPE_FACTORS=longrope_best.txt CP_CKPT_RESUME=$EVAL_RUN \

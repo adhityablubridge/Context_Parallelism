@@ -566,6 +566,24 @@ public:
         rotator_type_ != RotatorType::AllGather;
     const Dtype ring_dt = RING_BF16 ? Dtype::Bfloat16 : Dtype::Float32;
 
+    // CP_SAVE_KV_BF16=1: store the backward saved-K/V in bf16 (halves the persistent
+    // saved-activation memory; scales with T). GATED to use_rope_: only the fused-RoPE
+    // kernel casts K/V to bf16, so backward on bf16-saved is bit-identical by idempotency.
+    // The sm89 non-RoPE backward runs fp32/TF32 (no cast) -> bf16-saved would inject real
+    // error there, so it's a NO-OP on that path (one-time rank-0 warn). Value-aware OFF.
+    const char *_save_kv_bf16 = std::getenv("CP_SAVE_KV_BF16");
+    const bool _save_kv_req =
+        (_save_kv_bf16 != nullptr) && !(_save_kv_bf16[0] == '0' && _save_kv_bf16[1] == '\0');
+    static const bool SAVE_KV_BF16 = _save_kv_req && use_rope_;
+    if (_save_kv_req && !use_rope_) {
+      static bool _skv_warned = false;
+      if (!_skv_warned && cplog::log_rank()) {
+        _skv_warned = true;
+        fprintf(stderr, "[CP] CP_SAVE_KV_BF16 ignored: requires the fused-RoPE path "
+                        "(use_rope_); the sm89 backward is fp32/TF32.\n");
+      }
+    }
+
     int64_t k_numel = local_k.numel();
     int64_t kv_numel = k_numel * 2;
     // [#6] Persistent double-buffered send staging + rotator, keyed on the
@@ -769,8 +787,17 @@ public:
       // When recompute_k_=true, only save step 0 (local K,V) as the starting
       // point for backward re-rotation. Other steps are recomputed.
       if (!recompute_k_ || i == 0) {
-        saved_k_chunks[i] = curr_k.clone();
-        saved_v_chunks[i] = curr_v.clone();
+        if (SAVE_KV_BF16) {
+          // Store bf16 (halves persistent saved-K/V). curr_k is the in-scope fp32 tensor;
+          // under RING_BF16 bf16(curr_k)==rk exactly (idempotent RNE), so this equals saving
+          // the received bf16. .contiguous(): at i==0 curr_k is the caller's (possibly strided)
+          // local_k. as_type allocates -> no extra .clone(). Backward upcasts transiently.
+          saved_k_chunks[i] = curr_k.contiguous().as_type(Dtype::Bfloat16);
+          saved_v_chunks[i] = curr_v.contiguous().as_type(Dtype::Bfloat16);
+        } else {
+          saved_k_chunks[i] = curr_k.clone();   // EXISTING fp32 path, untouched
+          saved_v_chunks[i] = curr_v.clone();
+        }
       }
       saved_causal_flags[i] = use_causal;
       saved_partial_flags[i] = use_partial;
@@ -1054,7 +1081,9 @@ public:
         cudaStreamSynchronize(0);
         for (int s = 0; s < world_size_; ++s) {
           if (!saved_k_chunks[s].is_valid()) continue;
-          Tensor h = saved_k_chunks[s].to_cpu();
+          // Upcast to fp32 before the raw data<float>() dump: under CP_SAVE_KV_BF16 the saved
+          // chunk is bf16, and type-punning it as float would 2x-OOB-read. No-op when fp32.
+          Tensor h = saved_k_chunks[s].as_type(Dtype::Float32).to_cpu();
           std::string path = std::string("/tmp/cp_bwd_test/cpp_kvchunk_k") +
                              std::to_string(s) + "_rank" +
                              std::to_string(rank_) + ".bin";
