@@ -146,8 +146,17 @@ class Evaluator:
         ld = env.get("LD_LIBRARY_PATH", "")
         env["LD_LIBRARY_PATH"] = ("BluTrain/Tensor-Implementations/lib:"
                                   "BluTrain/Profiler/lib:" + ld)
-        # single rank via mpirun for the CP process-group init
-        cmd = ["mpirun", "-np", "1", args.exec]
+        # Launch one rank per CP shard (derived from CP_SIZE in --arch). The C++
+        # resident evaluator broadcasts each candidate genome from rank 0 to all
+        # ranks and reduces the fitness, so the GA still feeds ONE stdin and reads
+        # ONE "PPL <v>" line back (non-master ranks print nothing). cuda_devices must
+        # expose all CP GPUs (comma list) so cudaSetDevice(rank) binds rank->GPU.
+        cp_size = 1
+        for kv in args.arch.split():
+            k, v = kv.split("=", 1)
+            if k == "CP_SIZE":
+                cp_size = int(v)
+        cmd = ["mpirun", "-np", str(cp_size), args.exec]
         self.tmp = tempfile.mkdtemp(prefix="lrsearch_")
         # capture the evaluator's stderr so we can surface the REAL error on death
         self.errpath = os.path.join(self.tmp, "evaluator.stderr")
@@ -229,11 +238,26 @@ def main():
 
     t0 = time.time()
     scored = []
-    for (lam, nh) in pop:
+    # Budget precondition floor: one FULL generation past the seeds. A search that
+    # only reaches the seeds (PI/NTK/YaRN) cannot demonstrate searched-vs-formula.
+    floor = args.pop + 2 * (args.n1 + args.n2)
+    for ci, (lam, nh) in enumerate(pop):
         if args.time_budget_sec and (time.time() - t0) > args.time_budget_sec:
             print("[gen 0] time budget reached during initial population -- stopping", flush=True)
             break
         scored.append((fitness(lam, nh), lam, nh))
+        # After candidate #1, project whether >= floor candidates fit the budget;
+        # abort at minute ~5 rather than discovering a seeds-only search at hour 8.
+        if ci == 0 and args.time_budget_sec:
+            per1 = time.time() - t0
+            fittable = int(args.time_budget_sec / per1) if per1 > 0 else 10 ** 9
+            print(f"[precheck] candidate #1 took {per1:.1f}s; ~{fittable} fit in "
+                  f"{args.time_budget_sec:.0f}s (floor={floor}, one generation past seeds)", flush=True)
+            if fittable < floor:
+                raise RuntimeError(
+                    f"budget precondition FAILED: ~{fittable} candidates fit but the floor is {floor}. "
+                    f"A seeds-only search proves nothing -- cut CALIB or the search length T, or raise "
+                    f"--time-budget-sec.")
     if not scored:
         raise RuntimeError("no candidate evaluated before the time budget expired")
     scored.sort(key=lambda x: x[0])

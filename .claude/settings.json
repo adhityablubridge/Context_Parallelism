@@ -19,7 +19,14 @@
       "Bash(nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv)",
       "Bash(nvidia-smi --query-compute-apps=pid,used_memory --format=csv)",
       "Bash(date '+%Y-%m-%d %H:%M'; echo \"---\"; tail -1 \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\" | cut -c1-90)",
-      "Bash(cat >> *)"
+      "Bash(cat >> *)",
+      "Bash(ls \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Reports/\" | tail -20)",
+      "Read(//home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Reports/**)",
+      "Bash(grep -n -i -E \"longrope|LongRoPE|CP_SIZE|context.parallel eval|YARN\" \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\" | tail -30)",
+      "Bash(ls -la Data_Loader/Data/ 2>/dev/null | head; echo \"--- remote root:\"; ls -la /mnt/volgrp03/3rd_floor/Adhitya/CP/Context_Parallelism/Data_Loader/Data 2>/dev/null | head)",
+      "Read(//mnt/volgrp03/3rd_floor/Adhitya/CP/Context_Parallelism/Data_Loader/**)",
+      "Bash(printf '%s\\\\n' \"2026-08-05 - Round-4 review of the CP-for-LongRoPE plan: all round-3 items applied and folded into the body; no design defects left. Remaining wiring gaps - CP_REWARMUP is a hardcoded literal at run_longrope_pipeline.sh:127/134 so CP_REWARMUP=50 is inert \\(needs \\\\${CP_REWARMUP:-100}\\), and the YaRN arm does not exist in the pipeline \\(needs an ARM=longrope|yarn switch with YARN_SCALE env, search skipped, and an arm tag in OUT/FT_RUN or the two Phase-1 YaRN arms overwrite each other\\); plus suggested CP_DUMP_ROPE pre-flight at s=32/64 for find_correction_range bad-range, disk budget for 6 base-ckpt branches, and two stale accounting lines - CP / .mdfiles/polished-cuddling-graham.md \\(review only, no code changed\\)\" >> \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\")",
+      "Bash(tail -3 \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\")"
     ],
     "additionalDirectories": [
       "/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault",

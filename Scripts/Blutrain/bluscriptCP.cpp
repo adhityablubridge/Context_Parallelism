@@ -31,6 +31,7 @@
 #include <cmath>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include <fstream>
 #include <filesystem>
 #include <map>
@@ -64,6 +65,7 @@
 #include "context_parallel/ContextParallel.h"   // ContextParallel, shard_sequence_pre_embed, RotatorType
 #include "context_parallel/CreamPositions.h"     // CREAM/PoSE/RandPos position-label generators
 #include "context_parallel/LongRoPEOps.h"         // build_rope_cache_longrope (searched cache)
+#include "context_parallel/RopeDeltas.h"          // cp::local_to_global_pos (CP eval position map)
 #include "ops/IndexingOps.h"                      // gather (cache-row select for CREAM)
 
 using namespace OwnTensor;
@@ -850,8 +852,19 @@ int main(int argc, char** argv) {
         if (cfg.T % (2 * cp_size) != 0)
             die("T=" + std::to_string(cfg.T) + " not divisible by 2*CP_SIZE=" + std::to_string(2*cp_size) + " (HeadTail)");
     } else {
+        // Pure Ulysses: contiguous sequence shard + all-to-all HEAD split across
+        // the CP group. Both q and kv heads must divide cp_size, else the split is
+        // ill-defined and (without this guard) throws late from UlyssesAttention.h.
         if (cfg.T % cp_size != 0)
             die("T=" + std::to_string(cfg.T) + " not divisible by CP_SIZE=" + std::to_string(cp_size) + " (contiguous)");
+        if (cp_size > 1 && cfg.q_heads % cp_size != 0)
+            die("CP_ATTN_MODE=ulysses: q_heads=" + std::to_string(cfg.q_heads) +
+                " not divisible by CP_SIZE=" + std::to_string(cp_size) +
+                " (heads are split across CP ranks; use CP_ATTN_MODE=ring for this head/CP combo)");
+        if (cp_size > 1 && cfg.kv_heads % cp_size != 0)
+            die("CP_ATTN_MODE=ulysses: kv_heads=" + std::to_string(cfg.kv_heads) +
+                " not divisible by CP_SIZE=" + std::to_string(cp_size) +
+                " (heads are split across CP ranks; use CP_ATTN_MODE=ring for this head/CP combo)");
     }
     if (cfg.head_dim != 64 && cfg.head_dim != 128)
         die("head_dim must be 64 or 128 (fused kernel)");
@@ -1361,72 +1374,85 @@ int main(int argc, char** argv) {
     // to stdout. Avoids reloading the model per candidate (~2560 candidates/search).
     // The Python GA feeds paths on stdin and reads PPL back. Requires CP_SIZE=1.
     if (std::getenv("CP_LONGROPE_SEARCH") && std::atoi(std::getenv("CP_LONGROPE_SEARCH")) != 0) {
-        if (cp_size != 1) die("CP_LONGROPE_SEARCH requires NP=1 / CP_SIZE=1");
-        const int     Tpos = static_cast<int>(cfg.T);
-        const int64_t V    = cfg.vocab_size;
-        const int     n_windows = static_cast<int>(env_i64("CP_EVAL_WINDOWS", 5));
-        const int64_t half = cfg.head_dim / 2;
+        // CP-enabled resident evaluator. Requires a SINGLE DP replica so every MPI
+        // rank is a CP rank and MPI_COMM_WORLD is the reduction group (dp_size==1 =>
+        // every rank reads the SAME val batch, then forward()/shard_targets shard it).
+        if (world_size != cp_size || dp_size != 1)
+            die("CP_LONGROPE_SEARCH requires a single DP replica: world_size == CP_SIZE and "
+                "dp_size == 1 (got world_size=" + std::to_string(world_size) +
+                ", CP_SIZE=" + std::to_string(cp_size) + ", dp_size=" + std::to_string(dp_size) + ")");
+        const int64_t half       = cfg.head_dim / 2;
+        const int     n_windows  = static_cast<int>(env_i64("CP_EVAL_WINDOWS", 5));
+        const int     skip_win   = static_cast<int>(env_i64("CP_EVAL_SKIP_WINDOWS", 0));
         // If CP_LONGROPE_MSCALE is set, bake YaRN's temperature into every candidate's
         // cache (fair-vs-YaRN search). m is per-candidate from the file's s (below).
         const bool    lr_mscale_on = std::getenv("CP_LONGROPE_MSCALE")
                                      && std::atoi(std::getenv("CP_LONGROPE_MSCALE")) != 0;
         if (is_master)
-            std::cerr << "[longrope-search] resident evaluator ready: T=" << Tpos
-                      << " windows=" << n_windows
+            std::cerr << "[longrope-search] resident CP evaluator ready: cp=" << cp_size
+                      << " T=" << cfg.T << " windows=" << n_windows << " skip=" << skip_win
                       << " (feed candidate factor-file paths on stdin; 'PPL <v>' per line back)\n";
-        std::string path;
-        while (std::getline(std::cin, path)) {
-            if (path.empty()) continue;
-            std::vector<float> lam; int64_t nhat = 0; int s_ = 0; int64_t slen = 0;
-            try { parse_longrope_factors(path, half, lam, nhat, s_, slen); }
-            catch (const std::exception& ex) {
-                if (is_master) std::cout << "ERR " << ex.what() << std::endl << std::flush;
-                continue;
+        // Per-candidate lockstep loop: rank 0 owns stdin + parsing, then BROADCASTS
+        // the parsed genome (ok flag + lambda + n_hat + s) so all ranks act together.
+        // A parse error broadcasts ok=0 => ALL ranks `continue` (no forward, no
+        // collective) — never a partial set entering NCCL. EOF broadcasts ok=-1.
+        while (true) {
+            int ok = 0;
+            std::string path;
+            std::vector<float> lam(static_cast<size_t>(half), 1.0f);
+            int64_t nhat = 0; int s_ = 0;
+            if (is_master) {
+                if (std::getline(std::cin, path) && !path.empty()) {
+                    int64_t slen = 0;
+                    try { parse_longrope_factors(path, half, lam, nhat, s_, slen); ok = 1; }
+                    catch (const std::exception& ex) {
+                        std::cout << "ERR " << ex.what() << std::endl << std::flush; ok = 0;
+                    }
+                } else {
+                    ok = -1;  // EOF / blank -> terminate
+                }
             }
-            // Rebuild only the cache (cheap CPU loop) and swap it onto every layer.
+            if (cp_size > 1) MPI_Bcast(&ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            if (ok == -1) break;
+            if (ok == 0)   continue;
+            if (cp_size > 1) {
+                MPI_Bcast(lam.data(), static_cast<int>(half), MPI_FLOAT, 0, MPI_COMM_WORLD);
+                long long nhat_ll = static_cast<long long>(nhat);
+                MPI_Bcast(&nhat_ll, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+                nhat = static_cast<int64_t>(nhat_ll);
+                MPI_Bcast(&s_, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            }
+            // Rebuild only the cache (cheap CPU loop, GLOBAL length) and swap it in.
             const float cand_mscale = (lr_mscale_on && s_ > 1)
                 ? (0.1f * std::log(static_cast<float>(s_)) + 1.0f) : 1.0f;
             Tensor lr = autograd::build_rope_cache_longrope(
                 cfg.T, cfg.head_dim, static_cast<float>(cfg.rope_theta), lam, nhat, device, cand_mscale);
             for (auto& a : model.attn) a->cp_->set_rope_cache(lr);
 
-            double tot_nll = 0.0; long long tot_cnt = 0;
+            // Fitness = mean NLL on the GPU (no host logits copy, no manual logsumexp).
+            // Each rank scores its local shard [B, T/cp_size, V]; equal token counts =>
+            // averaging per-rank means then /world_size gives the global mean NLL.
+            double sum_loss = 0.0; int nwin = 0;
             {
                 autograd::NoGradGuard no_grad;
                 val_loader.reset();
+                if (skip_win > 0) val_loader.skip_batches(static_cast<size_t>(skip_win));
                 for (int w = 0; w < n_windows; ++w) {
                     Batch b = val_loader.next_batch();
                     ShardedInputs shy = shard_targets(b.input, b.target);
-                    Tensor logits = model.forward(b.input);
-                    Tensor logits_cpu = logits.as_type(Dtype::Float32).to_cpu();
-                    const float* lp = logits_cpu.data<float>();
-                    Tensor y_cpu = shy.y_local.to_cpu();
-                    const Dtype ydt = y_cpu.dtype();
-                    const uint16_t* yp16 = (ydt == Dtype::UInt16) ? y_cpu.data<uint16_t>() : nullptr;
-                    const int32_t*  yp32 = (ydt == Dtype::Int32)  ? y_cpu.data<int32_t>()  : nullptr;
-                    const int64_t*  yp64 = (ydt == Dtype::Int64)  ? y_cpu.data<int64_t>()  : nullptr;
-                    const int Bcur = static_cast<int>(cfg.B);
-                    for (int t = 0; t < Tpos; ++t)
-                        for (int bi = 0; bi < Bcur; ++bi) {
-                            const size_t idx = static_cast<size_t>(bi) * Tpos + t;
-                            const float* row = lp + idx * V;
-                            float mx = row[0];
-                            for (int64_t v = 1; v < V; ++v) if (row[v] > mx) mx = row[v];
-                            double se = 0.0;
-                            for (int64_t v = 0; v < V; ++v) se += std::exp(static_cast<double>(row[v] - mx));
-                            const double lse = static_cast<double>(mx) + std::log(se);
-                            const int64_t tgt = yp16 ? static_cast<int64_t>(yp16[idx])
-                                               : yp64 ? yp64[idx]
-                                                      : static_cast<int64_t>(yp32[idx]);
-                            if (tgt < 0 || tgt >= V) continue;
-                            tot_nll += lse - static_cast<double>(row[tgt]);
-                            tot_cnt += 1;
-                        }
+                    Tensor logits = model.forward(b.input);                       // [B, T_local, V]
+                    Tensor loss   = autograd::sparse_cross_entropy_loss(logits, shy.y_local);
+                    sum_loss += static_cast<double>(loss.to_cpu().data<float>()[0]);
+                    ++nwin;
                 }
             }
-            const double mean_nll = tot_cnt > 0 ? tot_nll / static_cast<double>(tot_cnt) : 0.0;
+            float local_mean = nwin > 0 ? static_cast<float>(sum_loss / nwin) : 0.0f;
+            float global_mean = local_mean;
+            if (cp_size > 1)
+                MPI_Allreduce(&local_mean, &global_mean, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+            global_mean /= static_cast<float>(world_size);
             if (is_master)
-                std::cout << "PPL " << std::setprecision(8) << std::exp(mean_nll)
+                std::cout << "PPL " << std::setprecision(8) << std::exp(global_mean)
                           << std::endl << std::flush;
         }
         MPI_Finalize();
@@ -1434,15 +1460,22 @@ int main(int argc, char** argv) {
     }
 
     if (eval_ppl_mode) {
-        if (cp_size != 1)
-            throw std::runtime_error(
-                "CP_EVAL_PPL requires NP=1 / CP_SIZE=1 (per-position NLL is computed "
-                "without cross-rank gather).");
+        // CP-enabled per-position PPL. Single DP replica only (world==cp, dp==1) so
+        // MPI_COMM_WORLD is the reduction group; hybrid perm unsupported in v1.
+        if (world_size != cp_size || dp_size != 1)
+            die("CP_EVAL_PPL requires a single DP replica: world_size == CP_SIZE and dp_size == 1 "
+                "(got world_size=" + std::to_string(world_size) + ", CP_SIZE=" +
+                std::to_string(cp_size) + ", dp_size=" + std::to_string(dp_size) + ")");
+        if (cfg.hybrid_mode)
+            die("CP_EVAL_PPL does not support hybrid (ring x ulysses) yet; use CP_ATTN_MODE=ring or ulysses");
 
         int               n_windows = static_cast<int>(env_i64("CP_EVAL_WINDOWS", 10));
+        const int         skip_win  = static_cast<int>(env_i64("CP_EVAL_SKIP_WINDOWS", 0));
         const std::string out_csv   = std::getenv("CP_EVAL_OUT")
                                         ? std::getenv("CP_EVAL_OUT") : "ppl_vs_pos.csv";
-        const int     Tpos = static_cast<int>(cfg.T);
+        const int     Tpos    = static_cast<int>(cfg.T);            // GLOBAL length (CSV rows)
+        const int     Tlocal  = static_cast<int>(cfg.T) / cp_size;  // local shard length (logits)
+        const bool    lb      = cfg.ring_mode;                      // HeadTail vs contiguous map
         const int     Bloc = static_cast<int>(cfg.B);
         const int64_t V    = cfg.vocab_size;
 
@@ -1466,14 +1499,16 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("CP_EVAL_TOKENS_BIN size not a multiple of 4 (expect int32 tokens)");
             eval_toks.resize(static_cast<size_t>(nbytes) / 4);
             tf.read(reinterpret_cast<char*>(eval_toks.data()), nbytes);
-            const long long max_w = (static_cast<long long>(eval_toks.size()) - 1) / Tpos;
-            if (max_w <= 0)
-                throw std::runtime_error("CP_EVAL_TOKENS_BIN too short for one window at T=CP_T");
-            if (n_windows > max_w) {
+            // Windows AVAILABLE after skipping the calibration windows (held-out).
+            const long long total_w = (static_cast<long long>(eval_toks.size()) - 1) / Tpos;
+            if (total_w - skip_win <= 0)
+                throw std::runtime_error("CP_EVAL_TOKENS_BIN too short for skip+one window at T=CP_T");
+            if (n_windows > total_w - skip_win) {
                 if (is_master)
-                    std::cout << "[eval] clamping windows " << n_windows << " -> " << max_w
-                              << " (stream has " << eval_toks.size() << " tokens at T=" << Tpos << ")\n";
-                n_windows = static_cast<int>(max_w);
+                    std::cout << "[eval] clamping windows " << n_windows << " -> " << (total_w - skip_win)
+                              << " (stream has " << eval_toks.size() << " tokens at T=" << Tpos
+                              << ", skip=" << skip_win << ")\n";
+                n_windows = static_cast<int>(total_w - skip_win);
             }
             if (is_master)
                 std::cout << "[eval] shared token stream: " << eval_toks.size() << " int32 tokens from "
@@ -1481,29 +1516,33 @@ int main(int argc, char** argv) {
         }
 
         if (is_master)
-            std::cout << "[eval] PPL-vs-position: " << n_windows << " windows x B="
-                      << (bypass ? 1 : Bloc) << " T=" << Tpos << " (YARN_SCALE via env) -> "
-                      << out_csv << std::endl;
+            std::cout << "[eval] PPL-vs-position: " << n_windows << " windows (skip=" << skip_win
+                      << ") x B=" << (bypass ? 1 : Bloc) << " Tglobal=" << Tpos << " Tlocal=" << Tlocal
+                      << " cp=" << cp_size << " (YARN_SCALE via env) -> " << out_csv << std::endl;
 
+        // Per-GLOBAL-position accumulators (each rank fills only its shard's global
+        // slots; MPI_Reduce combines to the master which writes the full [0,T) CSV).
         std::vector<double>    sum_nll(static_cast<size_t>(Tpos), 0.0);
         std::vector<long long> cnt(static_cast<size_t>(Tpos), 0);
+        // Host-copy chunk over LOCAL positions -> peak host RAM is CHUNK*V floats
+        // per rank, NOT Tlocal*V (which is 13.2 GB/rank at s=64). MANDATORY (round 3).
+        const int CHUNK = 4096;
+        std::vector<float> host_buf;
 
         autograd::NoGradGuard no_grad;
-        if (!bypass) val_loader.reset();
-        // CREAM (additive): install ONE fixed labeling for the whole eval so the
-        // per-physical-position NLL accumulation is consistent across windows. No-op
-        // when off (base cache is used, byte-identical to prior eval behavior).
+        if (!bypass) { val_loader.reset(); if (skip_win > 0) val_loader.skip_batches(static_cast<size_t>(skip_win)); }
+        // CREAM (additive): install ONE fixed labeling for the whole eval. No-op when
+        // off, and CREAM is single-GPU (dies earlier under CP), so inert here at cp>1.
         if (cream_on) model.install_cream_positions(cfg.cream_seed);
         for (int w = 0; w < n_windows; ++w) {
-            // Produce (input, y_local) either from the shared token stream (B=1)
-            // or from val_loader (B=cfg.B) — accumulation below uses the actual
-            // per-window batch size Bcur so both paths share the same NLL code.
+            // Build the FULL [Bcur, Tglobal] input; forward() shards it internally and
+            // returns local [Bcur, Tlocal, V] logits (y_local is the matching shard).
             Tensor input, y_local;
             int    Bcur;
             if (bypass) {
                 Bcur = 1;
                 std::vector<uint16_t> xh(static_cast<size_t>(Tpos)), yh(static_cast<size_t>(Tpos));
-                const size_t base = static_cast<size_t>(w) * static_cast<size_t>(Tpos);
+                const size_t base = static_cast<size_t>(skip_win + w) * static_cast<size_t>(Tpos);
                 for (int t = 0; t < Tpos; ++t) {
                     const int32_t xi = eval_toks[base + t];
                     const int32_t yi = eval_toks[base + t + 1];
@@ -1522,23 +1561,22 @@ int main(int argc, char** argv) {
                            cudaMemcpyHostToDevice);
                 cudaMemcpy(tgt.data(),   yh.data(), static_cast<size_t>(Tpos) * sizeof(uint16_t),
                            cudaMemcpyHostToDevice);
-                ShardedInputs shy = shard_targets(input, tgt);      // cp_size==1 => no-op reshard
+                ShardedInputs shy = shard_targets(input, tgt);   // shards to [1, Tlocal]
                 y_local = shy.y_local;
             } else {
                 Batch b = val_loader.next_batch();
                 Bcur = Bloc;
                 input = b.input;
-                ShardedInputs shy = shard_targets(b.input, b.target);   // cp_size==1 => full [B,T]
+                ShardedInputs shy = shard_targets(b.input, b.target);   // shards to [Bloc, Tlocal]
                 y_local = shy.y_local;
             }
-            Tensor logits = model.forward(input);                   // [Bcur,T,V]
-            // Logits: force fp32 host copy (attention returns fp32, but guard bf16).
-            Tensor logits_cpu = logits.as_type(Dtype::Float32).to_cpu();
-            const float* lp = logits_cpu.data<float>();
+            Tensor logits = model.forward(input);                          // [Bcur, Tlocal, V]
+            Tensor logits_dev = (logits.dtype() == Dtype::Float32) ? logits
+                                                                   : logits.as_type(Dtype::Float32);
+            const float* dptr = reinterpret_cast<const float*>(logits_dev.data());  // DEVICE ptr
 
-            // Targets: y_local inherits the loader dtype (UInt16), NOT int64 --
-            // read it in its actual dtype or indexing walks off the buffer.
-            Tensor y_cpu = y_local.to_cpu();                         // [Bcur,T]
+            // Targets: y_local inherits the loader dtype (UInt16) -- read in actual dtype.
+            Tensor y_cpu = y_local.to_cpu();                               // [Bcur, Tlocal] (small)
             const Dtype ydt = y_cpu.dtype();
             const uint16_t* yp16 = (ydt == Dtype::UInt16) ? y_cpu.data<uint16_t>() : nullptr;
             const int32_t*  yp32 = (ydt == Dtype::Int32)  ? y_cpu.data<int32_t>()  : nullptr;
@@ -1546,29 +1584,47 @@ int main(int argc, char** argv) {
             if (!yp16 && !yp32 && !yp64)
                 throw std::runtime_error("CP_EVAL_PPL: unexpected target dtype for y_local");
 
-            // Per-position NLL[t] = logsumexp(logits[b,t]) - logits[b,t, target].
-            // Each position t is written by one iteration only (safe to OMP over t
-            // if -fopenmp is enabled; harmless no-op otherwise).
-            #pragma omp parallel for schedule(dynamic)
-            for (int t = 0; t < Tpos; ++t) {
-                for (int bi = 0; bi < Bcur; ++bi) {
-                    const size_t idx = static_cast<size_t>(bi) * Tpos + t;
-                    const float* row = lp + idx * V;
-                    float mx = row[0];
-                    for (int64_t v = 1; v < V; ++v) if (row[v] > mx) mx = row[v];
-                    double se = 0.0;
-                    for (int64_t v = 0; v < V; ++v) se += std::exp(static_cast<double>(row[v] - mx));
-                    const double lse = static_cast<double>(mx) + std::log(se);
-                    const int64_t tgt = yp16 ? static_cast<int64_t>(yp16[idx])
-                                       : yp64 ? yp64[idx]
-                                              : static_cast<int64_t>(yp32[idx]);
-                    if (tgt < 0 || tgt >= V) continue;              // skip padding/ignore ids
-                    sum_nll[static_cast<size_t>(t)] += lse - static_cast<double>(row[tgt]);
-                    cnt[static_cast<size_t>(t)]     += 1;
+            // Per-LOCAL-position NLL, chunk-copied to host; each local tl maps to a
+            // unique GLOBAL position g (bijective per rank => OMP writes never collide).
+            for (int bi = 0; bi < Bcur; ++bi) {
+                for (int tl0 = 0; tl0 < Tlocal; tl0 += CHUNK) {
+                    const int clen = std::min(CHUNK, Tlocal - tl0);
+                    host_buf.resize(static_cast<size_t>(clen) * static_cast<size_t>(V));
+                    cudaMemcpy(host_buf.data(),
+                               dptr + (static_cast<size_t>(bi) * Tlocal + tl0) * static_cast<size_t>(V),
+                               static_cast<size_t>(clen) * static_cast<size_t>(V) * sizeof(float),
+                               cudaMemcpyDeviceToHost);
+                    #pragma omp parallel for schedule(dynamic)
+                    for (int c = 0; c < clen; ++c) {
+                        const int tl = tl0 + c;
+                        const float* row = host_buf.data() + static_cast<size_t>(c) * static_cast<size_t>(V);
+                        float mx = row[0];
+                        for (int64_t v = 1; v < V; ++v) if (row[v] > mx) mx = row[v];
+                        double se = 0.0;
+                        for (int64_t v = 0; v < V; ++v) se += std::exp(static_cast<double>(row[v] - mx));
+                        const double lse = static_cast<double>(mx) + std::log(se);
+                        const size_t idx = static_cast<size_t>(bi) * Tlocal + tl;
+                        const int64_t tgt = yp16 ? static_cast<int64_t>(yp16[idx])
+                                           : yp64 ? yp64[idx]
+                                                  : static_cast<int64_t>(yp32[idx]);
+                        if (tgt < 0 || tgt >= V) continue;              // skip padding/ignore ids
+                        const int g = OwnTensor::cp::local_to_global_pos(cp_rank, tl, Tlocal, cp_size, lb);
+                        sum_nll[static_cast<size_t>(g)] += lse - static_cast<double>(row[tgt]);
+                        cnt[static_cast<size_t>(g)]     += 1;
+                    }
                 }
             }
             if (is_master)
                 std::cout << "[eval] window " << (w + 1) << "/" << n_windows << " done" << std::endl;
+        }
+
+        // Combine per-position sums across CP ranks onto the master.
+        if (cp_size > 1) {
+            std::vector<double>    g_nll(static_cast<size_t>(Tpos), 0.0);
+            std::vector<long long> g_cnt(static_cast<size_t>(Tpos), 0);
+            MPI_Reduce(sum_nll.data(), g_nll.data(), Tpos, MPI_DOUBLE,    MPI_SUM, 0, MPI_COMM_WORLD);
+            MPI_Reduce(cnt.data(),     g_cnt.data(), Tpos, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+            if (is_master) { sum_nll.swap(g_nll); cnt.swap(g_cnt); }
         }
 
         if (is_master) {

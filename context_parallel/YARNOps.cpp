@@ -58,8 +58,12 @@ Tensor build_rope_cache(int64_t seq_len, int64_t head_dim, float base, DeviceInd
     const float b_fast = yarn_env_f("YARN_BETA_FAST",   32.0f);  // "beta"  (high-rotation bound)
     const float b_slow = yarn_env_f("YARN_BETA_SLOW",   1.0f);   // "alpha" (low-rotation bound)
 
-    // Attention temperature m (s==1 -> m==1 -> no scaling).
-    const float m = (s > 1.0f) ? (0.1f * std::log(s) + 1.0f) : 1.0f;
+    // Attention temperature m (s==1 -> m==1 -> no scaling). YARN_NO_MSCALE=1
+    // forces m=1 for the fair-comparison "YaRN without temperature" arm of the
+    // LongRoPE study (default keeps m, so unset behavior is byte-identical).
+    const bool  yarn_no_m = std::getenv("YARN_NO_MSCALE") != nullptr &&
+                            std::atoi(std::getenv("YARN_NO_MSCALE")) != 0;
+    const float m = (!yarn_no_m && s > 1.0f) ? (0.1f * std::log(s) + 1.0f) : 1.0f;
 
     const int64_t half = head_dim / 2;
 

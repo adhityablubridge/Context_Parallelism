@@ -86,5 +86,20 @@ inline SdpaDeltas compute_deltas(int r, int i, int N, int Tl, bool lb, SubChunk 
   return SdpaDeltas{ q, k };
 }
 
+// Global sequence position of local index `i` on rank `r`, for the eval/shard
+// layout that shard_sequence_pre_embed (ContextParallel.h:122-139) and
+// headtail_kernel.cu:44-51 produce. `Tl = T/N` is the local shard length; `lb`
+// is HeadTail load-balancing (cfg.ring_mode). This is the SINGLE source of truth
+// for the CP PPL-eval position map (do NOT re-inline the arithmetic elsewhere).
+//   contiguous (lb=false): g = r*Tl + i
+//   HeadTail  (lb=true) : cs=Tl/2; g = (i<cs) ? r*cs+i : (2N-1-r)*cs + (i-cs)
+// Degenerates to identity for N==1 (r==0 => g==i), matching the single-GPU path.
+inline int local_to_global_pos(int r, int i, int Tl, int N, bool lb) {
+  if (!lb) return r * Tl + i;
+  const int cs = Tl / 2;
+  return (i < cs) ? (r * cs + i)
+                  : ((2 * N - 1 - r) * cs + (i - cs));
+}
+
 } // namespace cp
 } // namespace OwnTensor
