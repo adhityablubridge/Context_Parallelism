@@ -26,7 +26,10 @@
       "Bash(ls -la Data_Loader/Data/ 2>/dev/null | head; echo \"--- remote root:\"; ls -la /mnt/volgrp03/3rd_floor/Adhitya/CP/Context_Parallelism/Data_Loader/Data 2>/dev/null | head)",
       "Read(//mnt/volgrp03/3rd_floor/Adhitya/CP/Context_Parallelism/Data_Loader/**)",
       "Bash(printf '%s\\\\n' \"2026-08-05 - Round-4 review of the CP-for-LongRoPE plan: all round-3 items applied and folded into the body; no design defects left. Remaining wiring gaps - CP_REWARMUP is a hardcoded literal at run_longrope_pipeline.sh:127/134 so CP_REWARMUP=50 is inert \\(needs \\\\${CP_REWARMUP:-100}\\), and the YaRN arm does not exist in the pipeline \\(needs an ARM=longrope|yarn switch with YARN_SCALE env, search skipped, and an arm tag in OUT/FT_RUN or the two Phase-1 YaRN arms overwrite each other\\); plus suggested CP_DUMP_ROPE pre-flight at s=32/64 for find_correction_range bad-range, disk budget for 6 base-ckpt branches, and two stale accounting lines - CP / .mdfiles/polished-cuddling-graham.md \\(review only, no code changed\\)\" >> \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\")",
-      "Bash(tail -3 \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\")"
+      "Bash(tail -3 \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\")",
+      "Bash(grep -inE \"ring|parity|precision|fused.?rope|headtail|rope.*cp|cp.*rope|delta\" \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\" | tail -40)",
+      "Bash(grep -inE \"parity.*\\(pass|max|diff|ok|✓|match\\)|ring.*\\(pass|verif|correct|match\\)|maxdiff|max_?diff|2.?rank|ws=2|2.?gpu.*\\(pass|parit\\)|de-?zigzag|HeadTail.*\\(pass|match|verif\\)\" \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\" | grep -iE \"ring|headtail|rope|parit|zigzag\" | tail -30)",
+      "Bash(nvidia-smi --query-gpu=index,name,memory.free --format=csv)"
     ],
     "additionalDirectories": [
       "/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault",

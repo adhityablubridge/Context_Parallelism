@@ -1466,8 +1466,8 @@ int main(int argc, char** argv) {
             die("CP_EVAL_PPL requires a single DP replica: world_size == CP_SIZE and dp_size == 1 "
                 "(got world_size=" + std::to_string(world_size) + ", CP_SIZE=" +
                 std::to_string(cp_size) + ", dp_size=" + std::to_string(dp_size) + ")");
-        if (cfg.hybrid_mode)
-            die("CP_EVAL_PPL does not support hybrid (ring x ulysses) yet; use CP_ATTN_MODE=ring or ulysses");
+        // Hybrid (ring x ulysses) IS supported: the per-position global map is read
+        // from shy.pos_local (the shard's own composed perm), not hand-derived below.
 
         int               n_windows = static_cast<int>(env_i64("CP_EVAL_WINDOWS", 10));
         const int         skip_win  = static_cast<int>(env_i64("CP_EVAL_SKIP_WINDOWS", 0));
@@ -1475,7 +1475,6 @@ int main(int argc, char** argv) {
                                         ? std::getenv("CP_EVAL_OUT") : "ppl_vs_pos.csv";
         const int     Tpos    = static_cast<int>(cfg.T);            // GLOBAL length (CSV rows)
         const int     Tlocal  = static_cast<int>(cfg.T) / cp_size;  // local shard length (logits)
-        const bool    lb      = cfg.ring_mode;                      // HeadTail vs contiguous map
         const int     Bloc = static_cast<int>(cfg.B);
         const int64_t V    = cfg.vocab_size;
 
@@ -1537,7 +1536,7 @@ int main(int argc, char** argv) {
         for (int w = 0; w < n_windows; ++w) {
             // Build the FULL [Bcur, Tglobal] input; forward() shards it internally and
             // returns local [Bcur, Tlocal, V] logits (y_local is the matching shard).
-            Tensor input, y_local;
+            Tensor input, y_local, pos_local;   // pos_local[1,Tlocal] = global pos of each local idx
             int    Bcur;
             if (bypass) {
                 Bcur = 1;
@@ -1562,13 +1561,13 @@ int main(int argc, char** argv) {
                 cudaMemcpy(tgt.data(),   yh.data(), static_cast<size_t>(Tpos) * sizeof(uint16_t),
                            cudaMemcpyHostToDevice);
                 ShardedInputs shy = shard_targets(input, tgt);   // shards to [1, Tlocal]
-                y_local = shy.y_local;
+                y_local = shy.y_local; pos_local = shy.pos_local;
             } else {
                 Batch b = val_loader.next_batch();
                 Bcur = Bloc;
                 input = b.input;
                 ShardedInputs shy = shard_targets(b.input, b.target);   // shards to [Bloc, Tlocal]
-                y_local = shy.y_local;
+                y_local = shy.y_local; pos_local = shy.pos_local;
             }
             Tensor logits = model.forward(input);                          // [Bcur, Tlocal, V]
             Tensor logits_dev = (logits.dtype() == Dtype::Float32) ? logits
@@ -1583,6 +1582,11 @@ int main(int argc, char** argv) {
             const int64_t*  yp64 = (ydt == Dtype::Int64)  ? y_cpu.data<int64_t>()  : nullptr;
             if (!yp16 && !yp32 && !yp64)
                 throw std::runtime_error("CP_EVAL_PPL: unexpected target dtype for y_local");
+
+            // Global position of each LOCAL index, straight from the shard's own perm
+            // (pos_local). Works for contiguous, HeadTail, AND hybrid with no map math.
+            Tensor pos_cpu = pos_local.to_cpu();                           // [1, Tlocal] int64
+            const int64_t* posp = pos_cpu.data<int64_t>();
 
             // Per-LOCAL-position NLL, chunk-copied to host; each local tl maps to a
             // unique GLOBAL position g (bijective per rank => OMP writes never collide).
@@ -1608,7 +1612,7 @@ int main(int argc, char** argv) {
                                            : yp64 ? yp64[idx]
                                                   : static_cast<int64_t>(yp32[idx]);
                         if (tgt < 0 || tgt >= V) continue;              // skip padding/ignore ids
-                        const int g = OwnTensor::cp::local_to_global_pos(cp_rank, tl, Tlocal, cp_size, lb);
+                        const int g = static_cast<int>(posp[tl]);   // shy.pos_local[tl]
                         sum_nll[static_cast<size_t>(g)] += lse - static_cast<double>(row[tgt]);
                         cnt[static_cast<size_t>(g)]     += 1;
                     }
