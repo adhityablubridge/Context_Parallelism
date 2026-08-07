@@ -21,7 +21,7 @@
 #       --pop 64 --iters 40 --calib-windows 5 --out longrope_best.txt
 #   (use small --pop/--iters for a smoke run)
 # =============================================================================
-import argparse, math, os, random, subprocess, sys, tempfile, time
+import argparse, json, math, os, queue, random, subprocess, sys, tempfile, threading, time
 
 def build_args():
     ap = argparse.ArgumentParser()
@@ -53,6 +53,15 @@ def build_args():
                          "(writes best-so-far). Guarantees the search fits a time budget.")
     ap.add_argument("--out", default="longrope_best.txt")
     ap.add_argument("--cuda-devices", default=None, help="CUDA_VISIBLE_DEVICES for the evaluator")
+    ap.add_argument("--state", default=None,
+                    help="resume base path. Writes <state>.memo.jsonl (every evaluated candidate, "
+                         "so restarts never repeat a forward pass) and <state>.state.json (population "
+                         "+ generation, saved each gen). Re-running with the same --state resumes.")
+    ap.add_argument("--pool", type=int, default=1,
+                    help="candidate-parallel workers. Scores that many candidates at once, each on "
+                         "its own GPU subset (needs --cuda-devices with pool*CP_SIZE GPUs). Default 1 "
+                         "== the serial evaluator (byte-identical). Result is identical to serial for "
+                         "any pool size (see Tests/bluscriptcp/test_pool_equivalence.sh).")
     return ap.parse_args()
 
 # ---- grid ------------------------------------------------------------------
@@ -126,8 +135,19 @@ def write_factors(path, lam, nhat, s, search_len):
         f.write("lambda " + " ".join(f"{v:.2f}" for v in lam) + "\n")
 
 # ---- resident evaluator ----------------------------------------------------
+def arch_cp_size(arch):
+    """CP degree per candidate = CP_SIZE in --arch (default 1)."""
+    cp = 1
+    for kv in arch.split():
+        k, v = kv.split("=", 1)
+        if k == "CP_SIZE":
+            cp = int(v)
+    return cp
+
 class Evaluator:
-    def __init__(self, args):
+    # `devices` overrides CUDA_VISIBLE_DEVICES for THIS worker (a pool gives each
+    # worker its own GPU subset); None falls back to args.cuda_devices (serial path).
+    def __init__(self, args, devices=None):
         env = dict(os.environ)
         for kv in args.arch.split():
             k, v = kv.split("=", 1)
@@ -141,22 +161,20 @@ class Evaluator:
         env["CP_DATA_ROOT"] = args.data_root
         env["YARN_SCALE"] = str(args.s)
         env["YARN_ORIG_MAXPOS"] = str(int(args.orig_maxpos))
-        if args.cuda_devices is not None:
-            env["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
+        dev = devices if devices is not None else args.cuda_devices
+        if dev is not None:
+            env["CUDA_VISIBLE_DEVICES"] = dev
         ld = env.get("LD_LIBRARY_PATH", "")
         env["LD_LIBRARY_PATH"] = ("BluTrain/Tensor-Implementations/lib:"
                                   "BluTrain/Profiler/lib:" + ld)
         # Launch one rank per CP shard (derived from CP_SIZE in --arch). The C++
         # resident evaluator broadcasts each candidate genome from rank 0 to all
         # ranks and reduces the fitness, so the GA still feeds ONE stdin and reads
-        # ONE "PPL <v>" line back (non-master ranks print nothing). cuda_devices must
+        # ONE "PPL <v>" line back (non-master ranks print nothing). devices must
         # expose all CP GPUs (comma list) so cudaSetDevice(rank) binds rank->GPU.
-        cp_size = 1
-        for kv in args.arch.split():
-            k, v = kv.split("=", 1)
-            if k == "CP_SIZE":
-                cp_size = int(v)
-        cmd = ["mpirun", "-np", str(cp_size), args.exec]
+        self.cp_size = arch_cp_size(args.arch)
+        self.devices = dev
+        cmd = ["mpirun", "-np", str(self.cp_size), args.exec]
         self.tmp = tempfile.mkdtemp(prefix="lrsearch_")
         # capture the evaluator's stderr so we can surface the REAL error on death
         self.errpath = os.path.join(self.tmp, "evaluator.stderr")
@@ -196,6 +214,112 @@ class Evaluator:
         except Exception:
             self.p.kill()
 
+# ---- candidate-parallel pool ----------------------------------------------
+class EvaluatorPool:
+    """Scores a generation's candidates concurrently across P worker evaluators,
+    each on its own GPU subset. RESULT-IDENTICAL to serial: fitness is a pure
+    function of (lam,nhat); the RNG is never touched here; and memo/memo.jsonl are
+    mutated only on the caller thread AFTER a barrier (single writer -> no races,
+    no duplicate lines, deterministic order). P==1 == the serial evaluator.
+    Threads (not processes) suffice: eval() blocks on subprocess I/O, releasing the
+    GIL, and each worker owns its own subprocess (no shared pipe)."""
+    def __init__(self, args, memo, memo_fh):
+        self.args, self.memo, self.memo_fh = args, memo, memo_fh
+        cp = arch_cp_size(args.arch)
+        P = max(1, args.pool)
+        if args.cuda_devices:
+            devs = args.cuda_devices.split(",")
+            if len(devs) != P * cp:
+                raise SystemExit(f"--pool {P} x CP_SIZE {cp} = {P*cp} GPUs, but --cuda-devices "
+                                 f"lists {len(devs)} ({args.cuda_devices}). They must match.")
+            subsets = [",".join(devs[i*cp:(i+1)*cp]) for i in range(P)]
+        else:
+            subsets = [None] * P
+        self.workers = [Evaluator(args, devices=s) for s in subsets]
+        self.P = P
+        print(f"[pool] {P} worker(s) x CP={cp} GPU(s) each", flush=True)
+
+    def fitness_batch(self, cands):
+        """cands: list of (lam, nhat). Returns PPLs in the SAME input order.
+        Memo hits are free; unique uncached candidates are scored across workers."""
+        keys = [grid_key(lam, nh) for (lam, nh) in cands]
+        # unique + uncached, first-occurrence order (dedup within the batch so a
+        # repeated candidate is scored ONCE -> matches serial's memo behavior).
+        todo, seen = [], set()
+        for (lam, nh), k in zip(cands, keys):
+            if k in self.memo or k in seen:
+                continue
+            seen.add(k); todo.append((k, lam, nh))
+
+        results, results_lock = {}, threading.Lock()
+        live, live_lock = set(self.workers), threading.Lock()
+        errors = []
+        q = queue.Queue()
+        for item in todo:
+            q.put(item)
+
+        def work(w):
+            while True:
+                try:
+                    k, lam, nh = q.get(timeout=1.0)
+                except queue.Empty:
+                    with results_lock:
+                        if len(results) >= len(todo):   # everything scored -> done
+                            return
+                    continue                            # in-flight items remain; keep waiting
+                try:
+                    ppl = w.eval(lam, nh, self.args.s, self.args.target_t)
+                    with results_lock:
+                        results[k] = ppl
+                except Exception as ex:                 # worker died
+                    with live_lock:
+                        live.discard(w)
+                        remaining = len(live)
+                        errors.append(str(ex))
+                    if remaining > 0:
+                        q.put((k, lam, nh))             # re-dispatch to a live worker
+                    return
+
+        threads = [threading.Thread(target=work, args=(w,), daemon=True) for w in self.workers]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        if len(results) != len(todo):
+            tail = ("; last error: " + errors[-1]) if errors else ""
+            raise RuntimeError(f"pool scored {len(results)}/{len(todo)} candidates -- "
+                               f"{len(self.workers)-len(live)} worker(s) died{tail}")
+
+        # Single-writer memo + jsonl on THIS thread, in first-occurrence order:
+        # deterministic, no races, identical memo contents to the serial path.
+        for (k, lam, nh) in todo:
+            ppl = results[k]
+            self.memo[k] = ppl
+            if self.memo_fh:
+                self.memo_fh.write(json.dumps({"lam": list(lam), "nhat": nh, "ppl": ppl}) + "\n")
+                self.memo_fh.flush()
+        return [self.memo[k] for k in keys]
+
+    def close(self):
+        for w in self.workers:
+            w.close()
+
+# ---- resume helpers --------------------------------------------------------
+def _rng_to_json(st):
+    return {"v": st[0], "s": list(st[1]), "g": st[2]}
+
+def _rng_from_json(d):
+    return (d["v"], tuple(d["s"]), d["g"])
+
+def save_ga_state(path, gen, scored, best_prev, no_improve, spent_sec):
+    # Atomic write (tmp + rename) so a kill mid-save can't corrupt the state file.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"gen": gen,
+                   "scored": [[p, list(lam), nh] for (p, lam, nh) in scored],
+                   "best_prev": best_prev, "no_improve": no_improve,
+                   "spent_sec": spent_sec, "rng": _rng_to_json(random.getstate())}, f)
+    os.replace(tmp, path)
+
 # ---- GA --------------------------------------------------------------------
 def main():
     args = build_args()
@@ -203,15 +327,31 @@ def main():
     half = args.head_dim // 2
     grid, lam_max = make_grid(args.s)
 
-    ev = Evaluator(args)
     memo = {}
-    def fitness(lam, nhat):
-        k = grid_key(lam, nhat)
-        if k in memo:
-            return memo[k]
-        ppl = ev.eval(lam, nhat, args.s, args.target_t)
-        memo[k] = ppl
-        return ppl
+    # ---- resume: warm the memo from every previously-evaluated candidate so a
+    # restart NEVER repeats a forward pass (the expensive part). ----
+    memo_path  = (args.state + ".memo.jsonl") if args.state else None
+    state_path = (args.state + ".state.json") if args.state else None
+    if memo_path and os.path.exists(memo_path):
+        nload = 0
+        with open(memo_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                memo[grid_key(d["lam"], d["nhat"])] = d["ppl"]; nload += 1
+        print(f"[resume] warmed memo with {nload} cached evaluations from {memo_path}", flush=True)
+    memo_fh = open(memo_path, "a") if memo_path else None
+
+    # Candidate-parallel pool (pool=1 == the serial evaluator). fitness_batch(cands)
+    # scores a whole generation at once and returns PPLs in INPUT order. The
+    # RNG-driven child construction stays serial (below), so the candidate set/order
+    # is unchanged and the result is identical for any pool size.
+    pool = EvaluatorPool(args, memo, memo_fh)
 
     def mutate(lam, nhat):
         child = [snap(random.choice(grid), lam_max) if random.random() < args.pmut else lam[i]
@@ -231,44 +371,67 @@ def main():
         (seed_YaRN(args.head_dim, args.s, args.orig_maxpos, args.beta_fast,
                    args.beta_slow, args.base, lam_max), 0),
     ]
-    pop = list(seeds)
-    while len(pop) < args.pop:
-        base = random.choice(seeds)
-        pop.append(mutate(base[0], base[1]))
+    # ---- resume the GA structure from a saved generation, if present ----
+    resumed = False
+    if state_path and os.path.exists(state_path):
+        with open(state_path) as f:
+            st = json.load(f)
+        scored     = [(p, lam, nh) for (p, lam, nh) in st["scored"]]
+        best_prev  = st["best_prev"]; no_improve = st["no_improve"]
+        start_it   = st["gen"]; spent0 = float(st["spent_sec"])
+        try:
+            random.setstate(_rng_from_json(st["rng"]))
+        except Exception:
+            pass
+        run_start = time.time()
+        resumed = True
+        print(f"[resume] GA state: gen={start_it} pop={len(scored)} best={scored[0][0]:.4f} "
+              f"spent={spent0/3600:.2f}h -- continuing", flush=True)
 
-    t0 = time.time()
-    scored = []
-    # Budget precondition floor: one FULL generation past the seeds. A search that
-    # only reaches the seeds (PI/NTK/YaRN) cannot demonstrate searched-vs-formula.
-    floor = args.pop + 2 * (args.n1 + args.n2)
-    for ci, (lam, nh) in enumerate(pop):
-        if args.time_budget_sec and (time.time() - t0) > args.time_budget_sec:
-            print("[gen 0] time budget reached during initial population -- stopping", flush=True)
-            break
-        scored.append((fitness(lam, nh), lam, nh))
-        # After candidate #1, project whether >= floor candidates fit the budget;
-        # abort at minute ~5 rather than discovering a seeds-only search at hour 8.
-        if ci == 0 and args.time_budget_sec:
-            per1 = time.time() - t0
-            fittable = int(args.time_budget_sec / per1) if per1 > 0 else 10 ** 9
+    if not resumed:
+        pop = list(seeds)
+        while len(pop) < args.pop:
+            base = random.choice(seeds)
+            pop.append(mutate(base[0], base[1]))
+        run_start = time.time(); spent0 = 0.0
+        # Budget precondition floor: one FULL generation past the seeds. A search that
+        # only reaches the seeds (PI/NTK/YaRN) cannot demonstrate searched-vs-formula.
+        floor = args.pop + 2 * (args.n1 + args.n2)
+        # Score candidate #1 alone (to TIME one forward), run the pool-aware precheck,
+        # then score the rest of the population as ONE parallel batch. The floor
+        # guarantees the whole population fits, so gen 0 is never truncated. Results
+        # are assembled in pop order -> identical to serial for any pool size.
+        t1 = time.time()
+        first_ppl = pool.fitness_batch([pop[0]])[0]
+        per1 = time.time() - t1
+        if args.time_budget_sec:
+            fittable = int(args.time_budget_sec * pool.P / per1) if per1 > 0 else 10 ** 9
             print(f"[precheck] candidate #1 took {per1:.1f}s; ~{fittable} fit in "
-                  f"{args.time_budget_sec:.0f}s (floor={floor}, one generation past seeds)", flush=True)
+                  f"{args.time_budget_sec:.0f}s across {pool.P} worker(s) "
+                  f"(floor={floor}, one generation past seeds)", flush=True)
             if fittable < floor:
                 raise RuntimeError(
                     f"budget precondition FAILED: ~{fittable} candidates fit but the floor is {floor}. "
-                    f"A seeds-only search proves nothing -- cut CALIB or the search length T, or raise "
-                    f"--time-budget-sec.")
-    if not scored:
-        raise RuntimeError("no candidate evaluated before the time budget expired")
-    scored.sort(key=lambda x: x[0])
-    print(f"[gen 0] seeds -> best PPL {scored[0][0]:.4f} "
-          f"(PI={memo.get(grid_key(seeds[0][0],0),'?')}, "
-          f"NTK={memo.get(grid_key(seeds[1][0],0),'?')}, "
-          f"YaRN={memo.get(grid_key(seeds[2][0],0),'?')})", flush=True)
+                    f"A seeds-only search proves nothing -- cut CALIB or the search length T, raise "
+                    f"--time-budget-sec, or add more --pool workers.")
+        rest = pool.fitness_batch(pop[1:]) if len(pop) > 1 else []
+        ppls = [first_ppl] + rest
+        scored = [(ppls[i], pop[i][0], pop[i][1]) for i in range(len(pop))]
+        scored.sort(key=lambda x: x[0])
+        print(f"[gen 0] seeds -> best PPL {scored[0][0]:.4f} "
+              f"(PI={memo.get(grid_key(seeds[0][0],0),'?')}, "
+              f"NTK={memo.get(grid_key(seeds[1][0],0),'?')}, "
+              f"YaRN={memo.get(grid_key(seeds[2][0],0),'?')})", flush=True)
+        best_prev = scored[0][0]; no_improve = 0; start_it = 0
+        if state_path:
+            save_ga_state(state_path, 0, scored, best_prev, no_improve, time.time() - run_start)
 
-    best_prev = scored[0][0]; no_improve = 0
-    for it in range(args.iters):
-        if args.time_budget_sec and (time.time() - t0) > args.time_budget_sec:
+    # cumulative wall-clock across restarts (spent0 carries prior runs' time)
+    def elapsed():
+        return spent0 + (time.time() - run_start)
+
+    for it in range(start_it, args.iters):
+        if args.time_budget_sec and elapsed() > args.time_budget_sec:
             print(f"[gen {it}] time budget ({args.time_budget_sec:.0f}s) reached -- stopping early", flush=True)
             break
         parents = scored[:args.topk]
@@ -279,26 +442,31 @@ def main():
         for _ in range(args.n2):
             pa, pb = random.sample(parents, 2)
             children.append(crossover((pa[1], pa[2]), (pb[1], pb[2])))
-        for (lam, nh) in children:
-            # also honor the budget mid-generation so one slow gen can't overrun far
-            if args.time_budget_sec and (time.time() - t0) > args.time_budget_sec:
-                break
-            scored.append((fitness(lam, nh), lam, nh))
+        # Score the whole generation in parallel (results in child order). The budget
+        # is checked at the top of the loop, so a generation is atomic -- pool size
+        # never changes WHICH candidates are scored, only how fast.
+        ppls = pool.fitness_batch(children)
+        for (lam, nh), ppl in zip(children, ppls):
+            scored.append((ppl, lam, nh))
         scored = sorted(scored, key=lambda x: x[0])[:args.pop]
-        el = time.time() - t0
         # early-stopping on convergence (right-sizes the search to the model)
         if scored[0][0] < best_prev - args.tol:
             best_prev = scored[0][0]; no_improve = 0
         else:
             no_improve += 1
         print(f"[gen {it+1}] best PPL {scored[0][0]:.4f}  n_hat={scored[0][2]}  "
-              f"evals={len(memo)}  no_improve={no_improve}  elapsed={el/3600:.2f}h", flush=True)
+              f"evals={len(memo)}  no_improve={no_improve}  elapsed={elapsed()/3600:.2f}h", flush=True)
+        # persist the GA structure at each generation boundary (resume point).
+        if state_path:
+            save_ga_state(state_path, it + 1, scored, best_prev, no_improve, elapsed())
         if args.patience and no_improve >= args.patience:
             print(f"[gen {it+1}] converged: no PPL improvement > {args.tol} for {args.patience} gens "
                   f"-- stopping", flush=True)
             break
 
-    ev.close()
+    pool.close()
+    if memo_fh:
+        memo_fh.close()
     best_ppl, best_lam, best_nhat = scored[0]
     write_factors(args.out, best_lam, best_nhat, args.s, args.target_t)
     print(f"\nBEST PPL {best_ppl:.4f}  n_hat={best_nhat}  -> {args.out}", flush=True)

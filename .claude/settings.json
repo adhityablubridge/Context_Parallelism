@@ -29,7 +29,15 @@
       "Bash(tail -3 \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\")",
       "Bash(grep -inE \"ring|parity|precision|fused.?rope|headtail|rope.*cp|cp.*rope|delta\" \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\" | tail -40)",
       "Bash(grep -inE \"parity.*\\(pass|max|diff|ok|✓|match\\)|ring.*\\(pass|verif|correct|match\\)|maxdiff|max_?diff|2.?rank|ws=2|2.?gpu.*\\(pass|parit\\)|de-?zigzag|HeadTail.*\\(pass|match|verif\\)\" \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\" | grep -iE \"ring|headtail|rope|parit|zigzag\" | tail -30)",
-      "Bash(nvidia-smi --query-gpu=index,name,memory.free --format=csv)"
+      "Bash(nvidia-smi --query-gpu=index,name,memory.free --format=csv)",
+      "Bash(python3 -m py_compile Tests/bluscriptcp/longrope_search.py)",
+      "Bash(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader)",
+      "Bash(python3 /tmp/claude-1000/-home-blu-bridge25-CP/3d0a11bb-de89-4095-8132-fc46c7f9936b/scratchpad/mock_pool_test.py)",
+      "Bash(tail -1 \"/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault/Claude Logs.md\")",
+      "Bash(awk '{print $6,$7,$8}')",
+      "Bash(CKPT_RUN=200 GPUS_SERIAL=0 GPUS_POOL=0,1 POOL=2 bash Tests/bluscriptcp/test_pool_equivalence.sh)",
+      "Bash(cd /home/blu-bridge25/CP; echo \"=== A.log tail ===\"; tail -15 /tmp/A.log)",
+      "Read(//tmp/**)"
     ],
     "additionalDirectories": [
       "/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault",
