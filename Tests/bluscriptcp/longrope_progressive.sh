@@ -63,6 +63,12 @@ STATE_DIR=${STATE_DIR:-longrope_prog_state}
 POP=${POP:-48}; N1=${N1:-15}; N2=${N2:-15}; ITERS=${ITERS:-30}; CALIB=${CALIB:-4}
 PATIENCE=${PATIENCE:-6}; TOL=${TOL:-0.01}
 SEARCH_BUDGET_SEC=${SEARCH_BUDGET_SEC:-10800}
+# Selection/mutation pressure. TOPK is how many of POP breed (paper ratio = POP/2,
+# i.e. 24 at POP=48; the arg default 32 = 67% dilutes selection). PMUT is the
+# per-dim RESAMPLE probability -- 0.3 randomizes ~10 of 32 dims per child, which
+# jumps far from a smooth optimum; ~0.1 refines near it. Use TOPK=24 PMUT=0.1 when
+# the seeds already win and you need local exploitation.
+TOPK=${TOPK:-32}; PMUT=${PMUT:-0.3}
 
 [ "$MSCALE" = "1" ] && ARCH="$ARCH CP_LONGROPE_MSCALE=1"
 # GPUs are chosen AT LAUNCH via GPUS (which GPUs) -- their count sets NP and CP_SIZE.
@@ -136,7 +142,7 @@ for S in $STAGES; do
         --target-t "$T" --s "$S" --head-dim "$HEAD_DIM" --orig-maxpos "$ORIG_MAXPOS" \
         --data-root "$DATA_ROOT" --cuda-devices "$GPUS" --arch "$SEARCH_ARCH" --pool "$POOL" \
         --pop "$POP" --n1 "$N1" --n2 "$N2" --iters "$ITERS" --calib-windows "$CALIB" \
-        --patience "$PATIENCE" --tol "$TOL" \
+        --topk "$TOPK" --pmut "$PMUT" --patience "$PATIENCE" --tol "$TOL" \
         --time-budget-sec "$SEARCH_BUDGET_SEC" --out "$best" \
         --state "$STATE_DIR/s${S}.search"
     touch "$m_search"

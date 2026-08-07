@@ -37,7 +37,12 @@
       "Bash(awk '{print $6,$7,$8}')",
       "Bash(CKPT_RUN=200 GPUS_SERIAL=0 GPUS_POOL=0,1 POOL=2 bash Tests/bluscriptcp/test_pool_equivalence.sh)",
       "Bash(cd /home/blu-bridge25/CP; echo \"=== A.log tail ===\"; tail -15 /tmp/A.log)",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Read(//mnt/volgrp03/3rd_floor/Adhitya/CP/**)",
+      "Bash(python3 -c \"import json;d=json.load\\(open\\('longrope_prog_state/s16.search.state.json'\\)\\);print\\('gen',d['gen'],'best',round\\(d['best_prev'],4\\),'spent_h',round\\(d['spent_sec']/3600,2\\)\\)\")",
+      "Bash(bash -n Tests/bluscriptcp/longrope_autorun.sh)",
+      "Bash(bash -n Tests/bluscriptcp/longrope_progressive.sh)",
+      "Bash(GPUS=0,1 MIN_FREE_MB=1 STABLE_CHECKS=2 POLL_SEC=1 SKIP_WAIT=0 timeout 25 bash -c ' *)"
     ],
     "additionalDirectories": [
       "/home/blu-bridge25/Documents/obsidian Vaults/Adhitya's Vault",
